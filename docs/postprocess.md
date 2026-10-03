@@ -168,8 +168,8 @@ planner as the expert kernels:
 If the planner selects recomputation, W13, SwiGLU, and W2 reconstruct `h3_MD` in
 shared scratch before postprocess backward. If it selects saved activations,
 `h3_MD` is read from the selected activation slot. Backward always uses the
-physical slot tensor saved by the matching forward, even if a later pipeline
-stage changes the context's current selection.
+physical slot ID in the matching forward's produced planner state, even if a
+later pipeline stage changes the context's current selection.
 
 <a id="follow-backward"></a>
 ## Follow backward

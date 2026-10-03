@@ -493,6 +493,12 @@ does not imply those broader compiler guarantees.
 Dynamic activation recomputation remains CUDA-graph compatible because the
 host launches one fixed sequence. Device predicates decide whether the
 recompute kernels perform work; the host does not branch on the planner result.
+Each training forward also returns an immutable snapshot of its selected
+activation slot with its planner offsets. Autograd saves that produced state,
+so selective activation-checkpoint recomputation cannot substitute a newer
+live slot selection. See the
+[BF16 execution guide](docs/bf16_execution.md#execution-and-graph-boundary) for
+the exact saved-state contract.
 
 <a id="use-advanced-features"></a>
 ## Use advanced features

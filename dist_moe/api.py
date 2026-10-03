@@ -2685,7 +2685,9 @@ def _run_registered_bf16_forward(
         options: Optional eager controls used inside the opaque operation.
 
     Returns:
-        Output and fixed-shape routing/planner state for backward.
+        Output and fixed-shape routing/planner state for backward. The packed
+        planner tensor contains five offsets followed by the selected-slot
+        snapshot produced by this forward.
     """
     context = _get_context(context_id)
     activation_buffer = context.activation_buffer
@@ -2727,15 +2729,15 @@ def _run_registered_bf16_forward(
         raise RuntimeError(
             f"BF16 training forward produced {len(saved_tensors)} saved tensors"
         )
-    forward_offsets_5 = kernel_ctx.forward_offsets
-    if forward_offsets_5.numel() != 5:
-        raise RuntimeError("BF16 forward planner produced an invalid offset tensor")
+    forward_state_6 = kernel_ctx.forward_offsets
+    if forward_state_6.numel() != 6:
+        raise RuntimeError("BF16 forward planner produced invalid cached state")
     postprocess_context = saved_tensors[-1]
     if postprocess_context is None:
         postprocess_context = x_TD.new_empty(0)
     return output_TD, [
         *saved_tensors[3:10],
-        forward_offsets_5,
+        forward_state_6,
         postprocess_context,
     ]
 
@@ -2786,7 +2788,9 @@ def _bf16_forward_op(
         context_id: Process-local execution context identifier.
 
     Returns:
-        Output followed by routing metadata and activation-plan tensors.
+        Output followed by routing metadata and activation-plan tensors. The
+        planner state contains five offsets followed by the selected-slot
+        snapshot produced by this forward.
     """
     return _run_registered_bf16_forward(
         x_TD,
@@ -2851,7 +2855,8 @@ def _fake_registered_bf16_forward(
         context_id: Process-local context identifier supplying static config.
 
     Returns:
-        Fake output followed by fixed-shape routing and planner tensors.
+        Fake output followed by fixed-shape routing and planner tensors,
+        including the six-element BF16 planner state.
     """
     del (
         topk_scores_TK,
@@ -2878,7 +2883,7 @@ def _fake_registered_bf16_forward(
         new_integer_tensor((world_size,), dtype=torch.int32),
         new_integer_tensor((1,), dtype=torch.int32),
         new_integer_tensor((1,), dtype=torch.bool),
-        new_integer_tensor((5,), dtype=torch.int64),
+        new_integer_tensor((6,), dtype=torch.int64),
         (
             torch.empty(
                 (x_TD.shape[0], topk_expert_ids_TK.shape[1]),
@@ -3089,7 +3094,8 @@ def _run_bf16_registered_backward(
         w13_EFD: Local gate/up weights.
         w2_EDF: Local down weights.
         topk_scores_TK: Router scores from forward.
-        state_tensors: Routing metadata followed by packed activation offsets.
+        state_tensors: Routing metadata followed by packed planner state whose
+            final value is the original forward's selected-slot snapshot.
         rmsnorm_enabled: Whether fused post-expert RMSNorm is selected.
         rmsnorm_eps: RMSNorm epsilon.
         rmsnorm_norm_output_dtype: Normalized route-output dtype.
@@ -3105,7 +3111,7 @@ def _run_bf16_registered_backward(
     Returns:
         Gradients for input, routing scores, w13, and w2.
     """
-    if len(state_tensors) != 10:
+    if len(state_tensors) != 9:
         raise RuntimeError(f"BF16 backward received {len(state_tensors)} state tensors")
     (
         num_recv_rows_per_local_expert_E,
@@ -3115,8 +3121,7 @@ def _run_bf16_registered_backward(
         num_recv_rows_per_rank_R,
         num_recv_rows_1,
         need_recompute,
-        forward_offsets_5,
-        activation_slot_id_1,
+        forward_state_6,
         postprocess_context,
     ) = state_tensors
     context = _get_context(context_id)
@@ -3136,9 +3141,14 @@ def _run_bf16_registered_backward(
         x_TD=grad_output_TD,
         topk_scores_TK=topk_scores_TK,
     )
-    x_offset, x_gathered_offset, h1_offset, h2_offset, h3_offset = (
-        forward_offsets_5.chunk(5)
-    )
+    (
+        x_offset,
+        x_gathered_offset,
+        h1_offset,
+        h2_offset,
+        h3_offset,
+        activation_slot_id_1,
+    ) = forward_state_6.chunk(6)
     kernel_ctx = _KernelAutogradContext()
     kernel_ctx.w13_input_shape = w13_EFD.shape
     kernel_ctx.w2_input_shape = w2_EDF.shape
@@ -3383,7 +3393,11 @@ def _bf16_setup_context(
     *,
     mark_state_non_differentiable: bool = True,
 ) -> None:
-    """Save BF16 forward state for the registered autograd formula.
+    """Save BF16 forward-produced state for the registered autograd formula.
+
+    The selected-slot snapshot comes from ``output``. The live selector input
+    may name a later slot during selective activation-checkpoint recomputation
+    and is never authoritative for a cached forward result.
 
     Args:
         ctx: PyTorch library autograd context.
@@ -3407,7 +3421,7 @@ def _bf16_setup_context(
         _rmsnorm_gain_center,
         rmsnorm_use_kahan,
         rmsnorm_recompute_rstd,
-        activation_slot_id_1,
+        _activation_slot_id_1,
         _num_moe_layers_in_slot,
         context_id,
     ) = inputs
@@ -3423,14 +3437,11 @@ def _bf16_setup_context(
     ctx.set_materialize_grads(False)
     if mark_state_non_differentiable:
         ctx.mark_non_differentiable(*state_tensors)
-    *planner_state, postprocess_context = state_tensors
     ctx.save_for_backward(
         w13_EFD,
         w2_EDF,
         topk_scores_TK,
-        *planner_state,
-        activation_slot_id_1,
-        postprocess_context,
+        *state_tensors,
     )
 
 

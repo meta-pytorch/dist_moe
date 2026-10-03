@@ -108,10 +108,16 @@ training:  dist_moe.routed_experts -> dist_moe::bf16_forward
 
 The inference schema names activation, routing, dispatch, combine, and optional
 clip-stat storage as mutated inputs. Training state is returned explicitly from
-the functional forward. FakeTensor propagation uses only metadata and never
-inspects routing or activation contents. Non-strict `make_fx` retains the
-opaque operations, and CUDA graphs replay the same preallocated addresses.
-Full `torch.compile` and strict export are not part of this release contract.
+the functional forward. The planner-produced BF16 state contains six device
+`int64` values: five activation-buffer offsets followed by the physical
+activation-slot ID selected by that forward. Registered autograd saves this
+produced state rather than rereading the live context selector. Selective
+activation checkpointing can therefore cache a forward from slot A while a
+recomputation observes slot B without redirecting A's backward state.
+FakeTensor propagation uses only metadata and never inspects routing or
+activation contents. Non-strict `make_fx` retains the opaque operations, and
+CUDA graphs replay the same preallocated addresses. Full `torch.compile` and
+strict export are not part of this release contract.
 
 ### Forward-only evaluation with a training context
 
@@ -131,7 +137,7 @@ the same context without a reset. This is distinct from
 | 1 | `copy_routing_and_dispatch()` | local `x_TD` and `topk_expert_ids_TK` | local symmetric routing/dispatch payloads | producer HBM until peers finish the layer | launch-ordered local writes |
 | 2 | symmetric-memory barrier | published payloads and signal workspace | peer-visible ordering state | device signal storage | EP device barrier; no CPU synchronization |
 | 3 | `dist_dispatch_routing()` | route IDs and peer base pointers | expert row counts plus gather/scatter pointer tables | ordinary local HBM, saved through backward | follows the publication barrier |
-| 4 | `get_forward_plan()` | row counts and selected activation slot | `need_recompute` plus byte offsets | device planner state, saved through backward | launch ordered; no host read |
+| 4 | `get_forward_plan()` | row counts and selected activation slot | `need_recompute` plus five byte offsets and a slot-ID snapshot | device planner state, saved through backward | launch ordered; no host read |
 | 5 | `dist_grouped_gemm_fprop_dispatch()` | peer/local BF16 dispatch rows and W13 | gathered `x` and BF16 `h1` at planned offsets | saved activation slot or shared scratch | pointer-driven peer reads after barrier |
 | 6 | `swiglu_fwd()` | BF16 `h1` | BF16 `h2` | saved activation slot or shared scratch | same-stream dependency |
 | 7 | `dist_grouped_gemm_fprop_combine()` | BF16 `h2` and W2 | BF16 route outputs in peer combine buffers | symmetric peer HBM, optionally copied to the slot | remote stores complete before the following barrier |
@@ -171,9 +177,11 @@ Pointers for `A` and `B` address rank 0's dispatch buffer; pointers for `C` and
 ### 3. Plan activation offsets
 
 `get_forward_plan()` updates the selected activation slot on device. It
-returns `need_recompute`, `activation_slot`, and offsets for `x`,
-`x_gathered`, `h1`, `h2`, and `h3`. Offsets are `int64` device tensors naming
-bytes within `ActivationBuffer.buffer`.
+returns `need_recompute` and a packed six-element state containing offsets for
+`x`, `x_gathered`, `h1`, `h2`, and `h3`, followed by the selected physical
+slot ID. The offsets are device `int64` byte positions within
+`ActivationBuffer.buffer`; the final scalar is the immutable slot snapshot
+for the matching backward.
 
 If the layer can retain all WGRAD inputs, persistent offsets grow through the
 activation slot. If not, only `x` is retained and `x_gathered/h1/h2/h3` use
@@ -240,7 +248,9 @@ context and conditionally saves the pre-normalization `h3` in the same activatio
 
 Autograd saves references to the logical weights, top-k scores, expert row
 counts, gather/scatter pointer tensors, per-rank counts, received-row count,
-`need_recompute`, all forward offsets, and the resolved activation slot.
+`need_recompute`, and the packed six-element planner state. That state owns all
+five forward offsets and the original forward's resolved activation slot.
+Backward never derives the slot from the context's current selector.
 
 The offset tensor is meaningful only with the context's activation buffer. It
 does not describe a standalone PyTorch allocation. The activation buffer owns the bytes;

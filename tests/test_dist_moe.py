@@ -2722,86 +2722,119 @@ class DistMoeKernelTest(unittest.TestCase):
             0,
         )
 
-    def _assert_bf16_training_checkpoint_preserves_effect_and_planner(
-        self,
-        options: dist_moe.ExecutionOptions | None = None,
-    ) -> None:
-        """Compare eager and checkpointed BF16 execution bitwise.
-
-        Args:
-            options: Optional invocation controls under test.
-        """
-        context, case_a, _, w13, w2 = self._create_case(inference=False)
-        x, ids, scores = case_a
-        grad_output = torch.randn_like(x)
-
-        def inputs() -> tuple[torch.Tensor, ...]:
-            """Clone one independent differentiable input set."""
-            return tuple(
-                tensor.detach().clone().requires_grad_()
-                for tensor in (x, scores, w13, w2)
-            )
-
-        def run(
-            input_x: torch.Tensor,
-            input_scores: torch.Tensor,
-            input_w13: torch.Tensor,
-            input_w2: torch.Tensor,
-        ) -> torch.Tensor:
-            """Run the DistMoE layer through its graph-visible autograd op."""
-            return dist_moe.routed_experts(
-                input_x,
-                ids,
-                input_scores,
-                input_w13,
-                input_w2,
-                context,
-                options=options,
-            )
-
-        reference_inputs = inputs()
-        reference = run(*reference_inputs)
-        reference.backward(grad_output)
-        reference_gradients = tuple(tensor.grad.clone() for tensor in reference_inputs)
-        context.reset()
-
-        effectful_ops = []
-
-        def policy(_ctx, op, *_args, **_kwargs) -> CheckpointPolicy:
-            """Save ordered effects while otherwise requesting recomputation."""
-            if has_effects(op):
-                effectful_ops.append(op)
-                return CheckpointPolicy.MUST_SAVE
-            return CheckpointPolicy.PREFER_RECOMPUTE
-
-        checkpoint_inputs = inputs()
-        actual = checkpoint(
-            run,
-            *checkpoint_inputs,
-            use_reentrant=False,
-            context_fn=lambda: create_selective_checkpoint_contexts(policy),
-            early_stop=False,
+    def test_sac_preserves_forward_activation_slot(self) -> None:
+        """SAC backward consumes the slot selected by the original forward."""
+        cases = (
+            ("bf16", None, torch.ops.dist_moe.bf16_forward.default),
+            (
+                "mxfp8",
+                dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.MXFP8_E4M3,
+                    pipeline="staged",
+                ),
+                torch.ops.dist_moe.block_scaled_forward.default,
+            ),
         )
-        actual.backward(grad_output)
+        for name, block_scaled, forward_op in cases:
+            with self.subTest(name=name):
+                context, case_a, _, w13, w2 = self._create_case(
+                    num_activation_slots=2,
+                    inference=False,
+                    block_scaled=block_scaled,
+                )
+                x, ids, scores = case_a
+                base_inputs = (x, scores, w13, w2)
+                grad_output = torch.randn_like(x)
 
-        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-        for actual_input, expected_gradient in zip(
-            checkpoint_inputs,
-            reference_gradients,
-            strict=True,
-        ):
-            torch.testing.assert_close(
-                actual_input.grad,
-                expected_gradient,
-                rtol=0,
-                atol=0,
-            )
-        self.assertIn(torch.ops.dist_moe.bf16_forward.default, effectful_ops)
-        self._assert_planner_reset(context.activation_buffer)
+                def inputs(
+                    values: tuple[torch.Tensor, ...] = base_inputs,
+                ) -> tuple[torch.Tensor, ...]:
+                    """Clone one independent differentiable input set."""
+                    return tuple(
+                        tensor.detach().clone().requires_grad_() for tensor in values
+                    )
 
-    def test_bf16_training_checkpoint_preserves_effect_and_planner(self) -> None:
-        """Deterministic BF16 checkpointing is bitwise and rewinds state."""
-        self._assert_bf16_training_checkpoint_preserves_effect_and_planner()
+                def layer(
+                    input_x: torch.Tensor,
+                    input_scores: torch.Tensor,
+                    input_w13: torch.Tensor,
+                    input_w2: torch.Tensor,
+                    expert_ids: torch.Tensor = ids,
+                    owner: dist_moe.Context = context,
+                ) -> torch.Tensor:
+                    """Run one registered DistMoE layer."""
+                    return dist_moe.routed_experts(
+                        input_x,
+                        expert_ids,
+                        input_scores,
+                        input_w13,
+                        input_w2,
+                        owner,
+                    )
+
+                context.select_activation_slot(0, 1)
+                reference_inputs = inputs()
+                reference = layer(*reference_inputs)
+                reference.backward(grad_output)
+                reference_gradients = tuple(
+                    tensor.grad.clone() for tensor in reference_inputs
+                )
+                self._assert_planner_reset(context.activation_buffer)
+                context.reset()
+
+                calls = 0
+                effectful_ops = []
+
+                def checkpointed_layer(
+                    *values: torch.Tensor,
+                    owner: dist_moe.Context = context,
+                    run=layer,
+                ) -> torch.Tensor:
+                    """Select a different live slot during SAC recomputation."""
+                    nonlocal calls
+                    owner.select_activation_slot(min(calls, 1), 1)
+                    calls += 1
+                    return run(*values)
+
+                def policy(
+                    _ctx,
+                    op,
+                    *_args,
+                    saved_ops=effectful_ops,
+                    **_kwargs,
+                ) -> CheckpointPolicy:
+                    """Cache ordered operations while recomputing pure work."""
+                    if has_effects(op):
+                        saved_ops.append(op)
+                        return CheckpointPolicy.MUST_SAVE
+                    return CheckpointPolicy.PREFER_RECOMPUTE
+
+                checkpoint_inputs = inputs()
+                actual = checkpoint(
+                    checkpointed_layer,
+                    *checkpoint_inputs,
+                    use_reentrant=False,
+                    context_fn=lambda: create_selective_checkpoint_contexts(policy),
+                    early_stop=False,
+                )
+                self.assertEqual(calls, 1)
+                actual.backward(grad_output)
+                self.assertEqual(calls, 2)
+
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                for actual_input, expected_gradient in zip(
+                    checkpoint_inputs,
+                    reference_gradients,
+                    strict=True,
+                ):
+                    torch.testing.assert_close(
+                        actual_input.grad,
+                        expected_gradient,
+                        rtol=0,
+                        atol=0,
+                    )
+                self.assertIn(forward_op, effectful_ops)
+                self._assert_planner_reset(context.activation_buffer)
 
     def test_clip_statistics_survive_activation_checkpointing(self) -> None:
         """Checkpoint recomputation preserves output, gradients, and counters."""

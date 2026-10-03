@@ -337,7 +337,8 @@ The graph-visible state contains:
 - route IDs/scores, expert row counts, gather/scatter pointers, and per-rank
   counts;
 - `need_recompute`, packed forward offsets, activation offsets, recompute
-  condition, and resolved activation slot;
+  condition, and the forward-produced snapshot of the resolved activation
+  slot;
 - the fused RMSNorm rstd context when `dist_moe.RMSNormPostprocess` is selected;
 - logical W13/W2 tensors as the normal autograd gradient owners.
 

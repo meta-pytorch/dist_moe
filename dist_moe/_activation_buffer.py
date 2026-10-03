@@ -81,6 +81,7 @@ from .kernels.activation_buffer import (
 logger = getLogger()
 
 _BF16_FORWARD_PLAN_OFFSET_COUNT = 5
+_BF16_FORWARD_STATE_COUNT = _BF16_FORWARD_PLAN_OFFSET_COUNT + 1
 _BLOCKSCALED_FORWARD_PLAN_OFFSET_COUNT = 9
 _BLOCKSCALED_BACKWARD_PLAN_OFFSET_COUNT = 16
 
@@ -2357,7 +2358,9 @@ def get_forward_plan(
             pointers because no backward can consume this forward.
 
     Returns:
-        ForwardPlan with need_recompute decision and memory offsets.
+        ForwardPlan with the recompute decision and memory offsets. BF16 packs
+        its five offsets and selected-slot snapshot into one forward-produced
+        state tensor for registered autograd.
         buffer_status is updated in place with new buffer_offsets and
         saved_activation_bytes_per_rank.
     """
@@ -2408,9 +2411,10 @@ def get_forward_plan(
 
     # Allocate output tensors for plan offsets
     need_recompute = torch.empty(1, dtype=torch.bool, device=device)
-    # Allocate offsets as one tensor to keep custom-op state compact.
+    # Pack offsets and the selected slot into one forward-produced tensor so
+    # cached SAC output owns every value needed by backward.
     fwd_offsets = torch.empty(
-        _BF16_FORWARD_PLAN_OFFSET_COUNT,
+        _BF16_FORWARD_STATE_COUNT,
         dtype=torch.int64,
         device=device,
     )
@@ -2451,7 +2455,9 @@ def get_forward_plan(
         h1_offset,
         h2_offset,
         h3_offset,
-    ) = fwd_offsets.chunk(_BF16_FORWARD_PLAN_OFFSET_COUNT)
+    ) = fwd_offsets[:_BF16_FORWARD_PLAN_OFFSET_COUNT].chunk(
+        _BF16_FORWARD_PLAN_OFFSET_COUNT
+    )
 
     forward_plan = ForwardPlan(
         need_recompute=need_recompute,

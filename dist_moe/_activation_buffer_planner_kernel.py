@@ -1139,6 +1139,7 @@ def _triton_get_forward_plan(
     scratch_h1_offset = scratch_h2_offset - h1_size
     scratch_x_gathered_offset = scratch_h1_offset - x_gathered_size
 
+    activation_slot_id = tl.load(microbatch_id_ptr).to(tl.int64)
     if scratch_only:
         # Nothing is saved, so the recompute flag is moot; report True so any
         # consumer that still reads it takes the no-saved-activations branch.
@@ -1150,7 +1151,7 @@ def _triton_get_forward_plan(
         h3_offset = tl.zeros([], dtype=tl.int64)
     else:
         # Load the device selector and map it to an activation slot.
-        microbatch_id = (tl.load(microbatch_id_ptr) % num_activation_slots).to(tl.int64)
+        microbatch_id = activation_slot_id % num_activation_slots
 
         # Load the selected activation slot's current offset.
         free_start = tl.load(buffer_offsets_ptr + microbatch_id)
@@ -1227,6 +1228,7 @@ def _triton_get_forward_plan(
     tl.store(fwd_offsets_ptr + 2, h1_offset)
     tl.store(fwd_offsets_ptr + 3, h2_offset)
     tl.store(fwd_offsets_ptr + 4, h3_offset)
+    tl.store(fwd_offsets_ptr + 5, activation_slot_id)
 
     scratch_bottom = tl.where(need_recompute, x_gathered_offset, h2_offset)
     # Also 0 for an inference-layout buffer, where activation_slot_bytes is 0.

@@ -47,9 +47,11 @@ output = stage(...)
 ```
 
 The context selects an immutable one-element view from its device slot-ID table
-for each scheduled forward. Forward saves that view in autograd state, so its
-matching backward retains the original physical slot even after later forwards
-select other views.
+for each scheduled forward. The planner copies that slot ID into the
+forward-produced planner state, and autograd saves the produced snapshot. Its
+matching backward therefore retains the original physical slot even after
+later forwards or selective activation-checkpoint recomputation select other
+views.
 
 A training-context call with no backward consumer does not acquire the selected
 slot. Under `torch.no_grad()`, BF16 and MXFP8 place their forward temporaries in
@@ -152,7 +154,8 @@ finalized schedule
   -> stage forward receives canonical IDs
   -> framework selects the assigned immutable device-scalar view
   -> every Dist-MoE layer in the stage advances that slot's layer counter
-  -> forward saves its resolved slot
+  -> planner returns offsets plus a snapshot of the resolved slot
+  -> autograd saves that forward-produced state
   -> backward consumes and releases the same slot in reverse layer order
 ```
 

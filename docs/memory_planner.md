@@ -131,11 +131,16 @@ The planner state is stored in small device tensors:
 - `peak_min_free_space[N + 1]`: per-region low-water marks;
 - `moe_layer_id[N]`: the next layer position in each selected slot;
 - `activation_slot_ids_S[S]`: immutable device scalars for every physical slot;
-- `activation_slot_id_1`: the selected one-element view saved by autograd.
+- `activation_slot_id_1`: the current one-element selector view supplied to the
+  next forward.
 
 The selected slot's MoE-layer depth is a static host integer. A pipeline stage
 has fixed local layer ownership, so tracing specializes that value while each
-scheduled call retains its graph-visible immutable slot view.
+scheduled call receives its graph-visible immutable selector view. The planner
+copies the selected slot ID into the forward-produced planner state. Autograd
+saves that produced snapshot, not the context's live selector, so later
+forwards and selective activation-checkpoint recomputation cannot change which
+slot the matching backward releases.
 
 Kernel inputs that name an activation-buffer value are device `int64`
 byte-offset tensors, not pointer-sized Python integers. A kernel forms
@@ -196,10 +201,10 @@ saving:                                      436,207,616 bytes (25%)
 
 The integration computes the static coloring before execution, selects an
 immutable device slot ID, and supplies the slot's static MoE-layer depth.
-Forward saves the device slot ID for backward, so both directions use the same
-graph-stable addresses without a host read in the captured step. Slot reuse is
-legal only when the schedule proves that the two stage-microbatch lifetimes do
-not overlap.
+The planner copies the device slot ID into forward-produced state for backward,
+so both directions use the same graph-stable addresses without a host read in
+the captured step. Slot reuse is legal only when the schedule proves that the
+two stage-microbatch lifetimes do not overlap.
 
 <a id="add-vmm-host-backed-scratch"></a>
 ## Add VMM host-backed scratch
