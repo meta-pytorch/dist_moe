@@ -1,0 +1,22 @@
+dist_moe
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+This product includes modified portions of Quack
+(https://github.com/Dao-AILab/quack):
+
+  dist_moe/kernels/_quack_compile_utils.py
+  dist_moe/kernels/_quack/copy_utils.py
+  dist_moe/kernels/_quack/cute_dsl_utils.py
+  dist_moe/kernels/_quack/cute_tensor.py
+  dist_moe/kernels/_quack/layout_utils.py
+  dist_moe/kernels/_quack/pipeline.py
+  dist_moe/kernels/_quack/reduce.py
+  dist_moe/kernels/_quack/reduction_base.py
+  dist_moe/kernels/_quack/rmsnorm_config.py
+  dist_moe/kernels/_quack_utils.py
+
+Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+Copyright (c) 2025-2026, Vijay Thakkar, Tri Dao.
+
+Quack is licensed under the Apache License, Version 2.0. A copy of that
+license is provided in LICENSES/Apache-2.0.txt.

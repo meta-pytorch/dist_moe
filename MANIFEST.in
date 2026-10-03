@@ -1,0 +1,11 @@
+include LICENSE
+include NOTICE
+include CONTRIBUTING.md
+include AGENTS.md
+include .pre-commit-config.yaml
+recursive-include .github *.in *.txt *.yml
+recursive-include LICENSES *
+recursive-include docs *.md
+recursive-include examples *.py
+include tests/AGENTS.md
+recursive-include tests *.py

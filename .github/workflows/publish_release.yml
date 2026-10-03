@@ -1,0 +1,149 @@
+name: Build and publish dist-moe release
+
+on:
+  workflow_dispatch:
+    inputs:
+      is_prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        type: boolean
+        required: false
+        default: false
+      publish_release:
+        description: "Stage and publish artifacts after validation"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Resolve and validate version
+        id: version
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+        run: |
+          version=$(python - <<'PY'
+          import pathlib
+          import tomllib
+
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          print(data["project"]["version"])
+          PY
+          )
+          tag="v${version}"
+          if [ "$PUBLISH_RELEASE" = "true" ]; then
+            if [ "$GITHUB_REF" != "refs/tags/${tag}" ]; then
+              echo "release must run from refs/tags/${tag}, not ${GITHUB_REF}" >&2
+              exit 1
+            fi
+            tag_sha=$(git rev-list -n 1 "$tag")
+            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "${tag} points to ${tag_sha}, not ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+      - name: Build and inspect distributions
+        run: |
+          python -m pip install --requirement .github/requirements/ci-cpu.txt
+          pre-commit run --all-files
+          uv pip compile .github/requirements/ci-cpu.in \
+            --python-platform x86_64-manylinux_2_28 \
+            --python-version 3.12 \
+            -o .github/requirements/ci-cpu.txt
+          git diff --exit-code -- .github/requirements
+          python -m build --no-isolation
+          twine check dist/*
+          DIST_MOE_ARTIFACT_DIR=dist python -m pytest -q \
+            tests/test_package_boundary.py::StaticPackageBoundaryTest \
+            tests/test_package_boundary.py::DistributionArtifactTest
+          (cd dist && sha256sum dist_moe-* > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  stage-release:
+    if: inputs.publish_release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+      - name: Stage GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+          PRERELEASE: ${{ inputs.is_prerelease }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists" >&2
+            exit 1
+          fi
+          args=(--draft --title "$TAG" --generate-notes --target "$GITHUB_SHA")
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" dist/* "${args[@]}"
+
+  publish:
+    if: inputs.publish_release
+    needs: [build, stage-release]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+      - name: Verify artifact identity
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          rm dist/SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+
+  finalize-release:
+    if: inputs.publish_release
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+          PRERELEASE: ${{ inputs.is_prerelease }}
+        run: |
+          gh release edit "$TAG" \
+            --draft=false \
+            --prerelease="$PRERELEASE"
