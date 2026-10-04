@@ -1277,6 +1277,157 @@ class DistMoeBufferTest(unittest.TestCase):
 class DistMoeKernelTest(unittest.TestCase):
     """Numerical tests for CuTe grouped GEMM and distributed MoE."""
 
+    def _run_fake_residual_chain(
+        self,
+        config: dist_moe.Config,
+        base_x_TD: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        base_topk_scores_TK: torch.Tensor,
+        base_weights: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ) -> tuple[torch.Tensor, ...]:
+        """Run a multi-rank FakePG residual chain and return owned results.
+
+        Args:
+            config: Dist-MoE memory and precision policy.
+            base_x_TD: Shared input values for policy comparisons.
+            topk_expert_ids_TK: Deterministic routed expert IDs.
+            base_topk_scores_TK: Shared router-score values.
+            base_weights: Shared high-precision expert-weight values.
+
+        Returns:
+            Output, input gradient, and one router-score gradient per layer.
+        """
+        context = dist_moe.create_context(group=dist.group.WORLD, config=config)
+        try:
+            x_TD = base_x_TD.detach().clone().requires_grad_()
+            score_tensors = []
+            output_TD = x_TD
+            context.select_activation_slot(
+                0,
+                config.max_moe_layers_per_activation_slot,
+            )
+            for w13_E2FD, w2_EDF in base_weights:
+                topk_scores_TK = base_topk_scores_TK.detach().clone().requires_grad_()
+                score_tensors.append(topk_scores_TK)
+                if config.block_scaled is None:
+                    w13_operand, w2_operand = w13_E2FD, w2_EDF
+                else:
+                    w13_operand = dist_moe.prepare_block_scaled_weight(
+                        w13_E2FD.flatten(1, 2),
+                        config.block_scaled,
+                    )
+                    w2_operand = dist_moe.prepare_block_scaled_weight(
+                        w2_EDF,
+                        config.block_scaled,
+                    )
+                output_TD = output_TD + dist_moe.routed_experts(
+                    output_TD,
+                    topk_expert_ids_TK,
+                    topk_scores_TK,
+                    w13_operand,
+                    w2_operand,
+                    context,
+                )
+            output_TD.float().square().mean().backward()
+            gradient_sources = (x_TD, *score_tensors)
+            gradients = []
+            for tensor in gradient_sources:
+                gradient = tensor.grad
+                self.assertIsNotNone(gradient)
+                assert gradient is not None
+                gradients.append(gradient.detach().clone())
+            return output_TD.detach().clone(), *gradients
+        finally:
+            context.close()
+
+    def test_multi_rank_fake_recompute_matches_saved_activations(self) -> None:
+        """Fake peer scatters make saved and recomputed training bitwise equal."""
+        dist.init_process_group(
+            backend="fake",
+            store=dist.HashStore(),
+            rank=0,
+            world_size=2,
+        )
+        torch.manual_seed(314159)
+        num_tokens, hidden_dim, intermediate_dim = 128, 256, 256
+        num_experts, top_k, num_layers = 4, 2, 2
+        token_T = torch.arange(num_tokens, device="cuda")[:, None]
+        slot_K = torch.arange(top_k, device="cuda")[None, :]
+        topk_expert_ids_TK = (token_T * top_k + slot_K) % num_experts
+        topk_scores_TK = torch.rand(num_tokens, top_k, device="cuda")
+        topk_scores_TK /= topk_scores_TK.sum(dim=1, keepdim=True)
+
+        def randn(*shape: int) -> torch.Tensor:
+            return torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+
+        x_TD = randn(num_tokens, hidden_dim)
+        weights = tuple(
+            (
+                randn(
+                    num_experts // 2,
+                    2,
+                    intermediate_dim,
+                    hidden_dim,
+                )
+                * hidden_dim**-0.5,
+                randn(
+                    num_experts // 2,
+                    hidden_dim,
+                    intermediate_dim,
+                )
+                * intermediate_dim**-0.5,
+            )
+            for _ in range(num_layers)
+        )
+
+        for block_scaled in (None, dist_moe.BlockScaledConfig()):
+            with self.subTest(block_scaled=block_scaled):
+                minimum = dist_moe.Config(
+                    num_local_input_tokens=num_tokens,
+                    hidden_dim=hidden_dim,
+                    intermediate_dim=intermediate_dim,
+                    top_k=top_k,
+                    num_experts=num_experts,
+                    max_moe_layers_per_activation_slot=num_layers,
+                    device_scratch_capacity_factor=1.0,
+                    num_activation_slots=1,
+                    block_scaled=block_scaled,
+                    wgrad_dtype=torch.float32,
+                )
+                maximum = dataclasses.replace(
+                    minimum,
+                    activation_slot_bytes=dist_moe.plan_memory(
+                        minimum,
+                        ep_size=2,
+                    ).maximum_useful_activation_slot_bytes,
+                )
+                expected = self._run_fake_residual_chain(
+                    maximum,
+                    x_TD,
+                    topk_expert_ids_TK,
+                    topk_scores_TK,
+                    weights,
+                )
+                actual = self._run_fake_residual_chain(
+                    minimum,
+                    x_TD,
+                    topk_expert_ids_TK,
+                    topk_scores_TK,
+                    weights,
+                )
+                self.assertEqual(len(actual), len(expected))
+                for actual_tensor, expected_tensor in zip(
+                    actual,
+                    expected,
+                    strict=True,
+                ):
+                    torch.testing.assert_close(
+                        actual_tensor,
+                        expected_tensor,
+                        rtol=0,
+                        atol=0,
+                    )
+
     def test_nvfp4_weight_preparation_owns_inverse_global_scale(self) -> None:
         """Prepared NVFP4 weights retain both global-scale orientations."""
         weight = torch.randn(

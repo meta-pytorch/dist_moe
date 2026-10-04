@@ -28,6 +28,7 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 from ._buffers import (
     _CommunicationBuffers,
+    _initialize_fake_peer_scatter_output,
     _routing_ids_view,
     initialize_multimem_barrier_workspace,
     is_fake_process_group,
@@ -1967,6 +1968,7 @@ class _Bf16Autograd(torch.autograd.Function):
 
         # 4. Execute FC13 dispatch, SwiGLU, and FC2 combine against planner
         # offsets; kernels write intermediates directly into activation-buffer storage.
+        _initialize_fake_peer_scatter_output(buffers.combine)
         with record_function("dist_moe_forward"):
             # The outer operation owns input publication and peer barriers.
             # Actual row counts stay on-device; this estimate only selects a
@@ -2212,6 +2214,7 @@ class _Bf16Autograd(torch.autograd.Function):
 
         # 3. Recompute kernels remain in the graph and use the device predicate
         # to become no-ops when forward state was retained.
+        _initialize_fake_peer_scatter_output(buffers.combine)
         with record_function("dist_moe_recompute"):
             dispatch_local_TD = buffers.dispatch.hdl.get_buffer(
                 buffers.dispatch.hdl.rank,
@@ -2369,6 +2372,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 feature_dim=w2_EDF.shape[2],
                 dtype=w2_EDF.dtype,
             )
+            _initialize_fake_peer_scatter_output(buffers.dispatch)
             grad_x_TKD = dist_grouped_gemm_dgrad_combine(
                 dy=backward_plan.grad_h1_offset,
                 w=w13_EFD,

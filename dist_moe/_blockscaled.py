@@ -48,6 +48,7 @@ from ._blockscaled_ops import (
 from ._blockscaled_weight import BlockscaledWeightSpec
 from ._buffers import (
     _CommunicationBuffers,
+    _initialize_fake_peer_scatter_output,
     _routing_ids_view,
     SymmetricMemoryBuffer,
 )
@@ -1561,6 +1562,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
 
         # 5. Execute either the staged or Mega fused expert pipeline. Both
         # produce route-wise H3 before the common postprocessing boundary.
+        _initialize_fake_peer_scatter_output(combine_buffer)
         with record_function("moe_forward_main"):
             if blockscaled_cfg is not None:
                 assert forward_plan.blockscaled is not None
@@ -1929,6 +1931,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
 
         # 4. Keep recomputation in the captured graph and predicate its memory
         # traffic and kernels on the device-side planner decision.
+        _initialize_fake_peer_scatter_output(combine_buffer)
         with record_function("moe_forward_recompute"):
             hidden_dim = w13_compute_EFD.shape[2]
             x_placeholder = _activation_buffer_placeholder(
@@ -2220,6 +2223,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
             # SwiGLU backward produces the FC13 route-gradient operand.
             intermediate_dim = w2_compute_EDF.shape[2]
             grad_w13_EFD = None
+            _initialize_fake_peer_scatter_output(dispatch_buffer)
             if blockscaled_cfg is not None:
                 assert backward_plan.blockscaled is not None
                 capacity_rows = model_config.max_recv_tokens

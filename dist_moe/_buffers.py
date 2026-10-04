@@ -53,9 +53,11 @@ class _FakeSymmetricMemory:
     """Local allocation modeling a multi-rank symmetric-memory handle.
 
     Fake process groups execute one virtual rank. Every peer pointer therefore
-    aliases the rank-local payload or signal pad. This preserves distributed
-    shapes, pointer-array sizes, graph topology, and local memory accounting;
-    it does not model communication progress or distributed numerics.
+    aliases the rank-local payload or signal pad. Peer-scatter destinations are
+    initialized before use so absent virtual writers contribute deterministic
+    zeros. This preserves distributed shapes, pointer-array sizes, graph
+    topology, local memory accounting, and stable local numerics; it does not
+    model communication progress or true multi-rank numerical equivalence.
     """
 
     def __init__(
@@ -494,6 +496,22 @@ def is_fake_symmetric_memory(buffer: SymmetricMemoryBuffer) -> bool:
         ``True`` for a fake symmetric-memory buffer.
     """
     return isinstance(buffer.hdl, _FakeSymmetricMemory)
+
+
+def _initialize_fake_peer_scatter_output(buffer: SymmetricMemoryBuffer) -> None:
+    """Initialize rows whose virtual FakePG peers have no physical writer.
+
+    FakePG aliases every logical peer pointer to one local allocation. A peer
+    scatter therefore writes only rows owned by the executing virtual rank,
+    while rows owned by other virtual ranks otherwise retain stale payloads.
+    Native symmetric memory has one physical writer for every routed row and
+    requires no initialization.
+
+    Args:
+        buffer: Symmetric-memory destination of a peer-scatter operation.
+    """
+    if is_fake_symmetric_memory(buffer):
+        buffer.local().zero_()
 
 
 @dataclasses.dataclass(frozen=True, init=False)
