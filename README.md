@@ -76,7 +76,7 @@ The initial release is validated with this runtime:
 | Platform | Linux ARM64; NVIDIA Blackwell (SM100 class) |
 | Framework | Python 3.12; PyTorch 2.14.0+cu130 |
 | GPU runtime | CUDA toolkit 13.0.3.0; NVRTC 13.0.88; CUDA Python 13.4.1; NCCL 2.30.7 |
-| Kernel toolchain | Triton 3.8.0; NVIDIA CUTLASS DSL 4.6.1 |
+| Kernel toolchain | Triton 3.8 or 3.9; NVIDIA CUTLASS DSL 4.6.1 |
 
 The PyTorch wheel runtime and the toolkit used for JIT compilation are separate
 compatibility requirements. Importing `dist_moe` does not initialize CUDA or a

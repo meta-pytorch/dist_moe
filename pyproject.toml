@@ -27,7 +27,7 @@ dependencies = [
     "nvidia-cutlass-dsl[cu13]>=4.6.0.dev0,<=4.8.0",
     "packaging",
     "torch>=2.14",
-    "triton>=3.8,<3.9",
+    "triton>=3.8,<3.10",
 ]
 
 [project.urls]
