@@ -852,7 +852,7 @@ def _make_wgrad_sf_view(
     rest_mn_size = (mn_extent + 127) // 128
     atom_k = cutlass.Int32(4 * sf_vec_size)
     rest_k_size = (k_g + atom_k - 1) // atom_k
-    mn_stride_basis = (cutlass.Int32(128) * k_whole) // sf_vec_size
+    mn_stride_basis = (cutlass.Int64(128) * k_whole) // sf_vec_size
     # Match ``tile_atom_to_shape_SF``'s hierarchical structure
     # ``((Atom_MN, Rest_MN), (Atom_K, Rest_K), Rest_L)`` exactly — the TMA
     # atom built at host time encodes the atom-vs-rest split, so a flat
