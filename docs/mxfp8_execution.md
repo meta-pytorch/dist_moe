@@ -32,7 +32,7 @@ the model configuration:
 
 ```python
 config = dist_moe.Config(
-    num_local_input_tokens=T,
+    max_num_local_input_tokens=T,
     hidden_dim=D,
     intermediate_dim=F,
     top_k=K,
@@ -65,7 +65,7 @@ at most 127 padding rows, so the conservative capacity is 256:
 
 ```python
 config = dist_moe.Config(
-    num_local_input_tokens=16,
+    max_num_local_input_tokens=16,
     hidden_dim=256,
     intermediate_dim=256,
     top_k=2,

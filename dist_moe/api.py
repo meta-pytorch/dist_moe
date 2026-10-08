@@ -30,6 +30,7 @@ from ._buffers import (
     _CommunicationBuffers,
     _initialize_fake_peer_scatter_output,
     _routing_ids_view,
+    _routing_token_count_view,
     initialize_multimem_barrier_workspace,
     is_fake_process_group,
 )
@@ -333,9 +334,9 @@ class Config:
     """Static execution configuration for a distributed MoE context.
 
     Args:
-        num_local_input_tokens: Exact physical input-token count on every EP
-            rank before top-k expansion. Callers with fewer logical tokens
-            must pad inputs, zero padded routing scores, and slice outputs.
+        max_num_local_input_tokens: Maximum physical input-token count on every
+            EP rank before top-k expansion. Each invocation may use any shared
+            rank-local count ``T`` in ``[1, max_num_local_input_tokens]``.
         hidden_dim: Model hidden dimension.
         intermediate_dim: Per-expert SwiGLU intermediate dimension.
         top_k: Number of experts selected per input token.
@@ -383,7 +384,7 @@ class Config:
             supported independently and does not consume activation slots.
     """
 
-    num_local_input_tokens: int
+    max_num_local_input_tokens: int
     hidden_dim: int
     intermediate_dim: int
     top_k: int
@@ -412,7 +413,7 @@ class Config:
         """
         if (
             min(
-                self.num_local_input_tokens,
+                self.max_num_local_input_tokens,
                 self.hidden_dim,
                 self.intermediate_dim,
                 self.top_k,
@@ -420,8 +421,8 @@ class Config:
             <= 0
         ):
             raise ValueError(
-                "num_local_input_tokens, hidden_dim, intermediate_dim, and top_k "
-                "must be positive"
+                "max_num_local_input_tokens, hidden_dim, intermediate_dim, "
+                "and top_k must be positive"
             )
         if self.hidden_dim % 64 != 0:
             raise ValueError("hidden_dim must be a multiple of 64 BF16 elements")
@@ -769,6 +770,7 @@ def _model_config(
     config: Config,
     *,
     ep_size: int | None = None,
+    num_local_input_tokens: int | None = None,
 ) -> ModelConfig:
     """Build the activation planner configuration for a public config.
 
@@ -776,6 +778,8 @@ def _model_config(
         config: Public distributed MoE configuration.
         ep_size: Expert-parallel group size. Required for topology-aware
             block-scaled capacity planning.
+        num_local_input_tokens: Actual local tokens for one invocation. ``None``
+            uses the configured maximum for static capacity planning.
 
     Returns:
         Activation planner model configuration.
@@ -808,7 +812,11 @@ def _model_config(
         dtype=torch.bfloat16,
         hidden_dim=config.hidden_dim,
         intermediate_dim=config.intermediate_dim,
-        num_tokens=config.num_local_input_tokens,
+        num_tokens=(
+            config.max_num_local_input_tokens
+            if num_local_input_tokens is None
+            else num_local_input_tokens
+        ),
         topk=config.top_k,
         max_imbalance_factor=config.device_scratch_capacity_factor,
         num_moe_layers=config.max_moe_layers_per_activation_slot,
@@ -958,7 +966,7 @@ def plan_memory(
             )
     total_activation_bytes = num_slots * selected_slot_bytes
     total_device_buffer = total_activation_bytes + device_scratch
-    balanced_rows = config.num_local_input_tokens * config.top_k
+    balanced_rows = config.max_num_local_input_tokens * config.top_k
     device_rows = model_config.max_recv_tokens
     total_rows = model_config._max_recv_tokens(total_factor)
     plan = MemoryPlan(
@@ -1203,13 +1211,13 @@ class Context:
         return context
 
     @property
-    def num_local_input_tokens(self) -> int:
-        """Return the fixed physical token count on every EP rank.
+    def max_num_local_input_tokens(self) -> int:
+        """Return the allocated local-token capacity on every EP rank.
 
         Returns:
-            Exact local input tokens required by every invocation.
+            Maximum local input tokens accepted by one invocation.
         """
-        return self.config.num_local_input_tokens
+        return self.config.max_num_local_input_tokens
 
     @property
     def hidden_dim(self) -> int:
@@ -1479,7 +1487,7 @@ def _create_comm_buffers(
         Communication buffers with the configured token capacity.
     """
     buffers = _CommunicationBuffers.create(
-        num_local_input_tokens=config.num_local_input_tokens,
+        max_num_local_input_tokens=config.max_num_local_input_tokens,
         hidden_dim=config.hidden_dim,
         top_k=config.top_k,
         group=group,
@@ -1640,13 +1648,13 @@ def create_context(  # noqa: C901
     return context
 
 
-def _validate_fixed_routing_shape(
+def _validate_routing_shape(
     x_TD: torch.Tensor,
     topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     context: Context,
 ) -> None:
-    """Validate the context's fixed physical token and routing shapes.
+    """Validate one bounded physical token and routing shape.
 
     Args:
         x_TD: Local input tokens.
@@ -1655,17 +1663,18 @@ def _validate_fixed_routing_shape(
         context: Pre-allocated execution context.
 
     Raises:
-        ValueError: If any physical shape differs from the context contract.
+        ValueError: If any physical shape exceeds the context contract.
     """
     if x_TD.ndim != 2 or x_TD.shape[1] != context.hidden_dim:
         raise ValueError(
             f"x_TD must have shape [T, {context.hidden_dim}], got {tuple(x_TD.shape)}"
         )
     num_local_input_tokens = x_TD.shape[0]
-    if num_local_input_tokens != context.num_local_input_tokens:
+    if not 1 <= num_local_input_tokens <= context.max_num_local_input_tokens:
         raise ValueError(
-            "local input token count must equal "
-            f"context.num_local_input_tokens={context.num_local_input_tokens}, "
+            "local input token count must be in "
+            f"[1, context.max_num_local_input_tokens="
+            f"{context.max_num_local_input_tokens}], "
             f"got {num_local_input_tokens}"
         )
     expected_routing_shape = (num_local_input_tokens, context.top_k)
@@ -1714,7 +1723,7 @@ def _validate_inputs(  # noqa: C901
         raise TypeError("topk_expert_ids_TK must use torch.int32 or torch.int64")
     if topk_scores_TK.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError("topk_scores_TK must use torch.bfloat16 or torch.float32")
-    _validate_fixed_routing_shape(
+    _validate_routing_shape(
         x_TD,
         topk_expert_ids_TK,
         topk_scores_TK,
@@ -1891,6 +1900,10 @@ class _Bf16Autograd(torch.autograd.Function):
         routing_local_TK = _routing_ids_view(
             buffers.routing, local_rank, topk_expert_ids_TK.shape
         )
+        routing_token_count_1 = _routing_token_count_view(
+            buffers.routing,
+            local_rank,
+        )
         dispatch_local_TD = buffers.dispatch.hdl.get_buffer(
             local_rank,
             x_TD.shape,
@@ -1902,6 +1915,7 @@ class _Bf16Autograd(torch.autograd.Function):
         with record_function("dist_moe_preprocess"):
             if config.inference:
                 routing_local_TK.copy_(topk_expert_ids_TK)
+                routing_token_count_1.fill_(num_local_input_tokens)
                 dispatch_local_TD.copy_(x_TD)
             else:
                 copy_routing_and_dispatch(
@@ -1909,6 +1923,7 @@ class _Bf16Autograd(torch.autograd.Function):
                     dispatch=dispatch_local_TD,
                     expert_ids=topk_expert_ids_TK,
                     routing=routing_local_TK,
+                    routing_token_count_1=routing_token_count_1,
                 )
             _ep_barrier(buffers.dispatch)
 
@@ -1931,6 +1946,7 @@ class _Bf16Autograd(torch.autograd.Function):
         model_config = _model_config(
             config,
             ep_size=dist.get_world_size(context.group),
+            num_local_input_tokens=num_local_input_tokens,
         )
         validate_buffer_capacity(
             buffer_size=activation_buffer.buffer.numel(),
@@ -3162,6 +3178,7 @@ def _run_bf16_registered_backward(
         model_config=_model_config(
             context.config,
             ep_size=dist.get_world_size(context.group),
+            num_local_input_tokens=grad_output_TD.shape[0],
         ),
         options=ExecutionOptions(experts_output_postprocess=postprocess_config),
         postprocess=postprocess,
@@ -3708,7 +3725,8 @@ def routed_experts(  # noqa: C901
 
     Args:
         x_TD: Contiguous CUDA BF16 local tokens with shape ``[T, D]``, where
-            ``T == context.num_local_input_tokens`` on every EP rank.
+            every EP rank uses the same
+            ``1 <= T <= context.max_num_local_input_tokens`` for this call.
         topk_expert_ids_TK: Contiguous CUDA int32 or int64 global expert IDs
             with shape ``[T, K]`` and values in ``[0, num_experts)``.
         topk_scores_TK: Contiguous CUDA BF16 or FP32 expert weights with shape
@@ -3740,8 +3758,7 @@ def routed_experts(  # noqa: C901
         Unequal physical token counts across EP ranks trigger a device-side
         trap before routing metadata is generated. This terminates the
         distributed iteration and invalidates the CUDA execution context;
-        callers cannot catch the failure and continue. Pad smaller logical
-        batches, zero their padded routing scores, and slice their outputs.
+        callers cannot catch the failure and continue.
 
         Exceeding total scratch capacity triggers a production device trap in
         the routing prefix or direct-decode kernel before final metadata is
@@ -3773,7 +3790,7 @@ def routed_experts(  # noqa: C901
             )
         if context.config.block_scaled is not None:
             raise ValueError("SwiGLU clip statistics are supported only by BF16")
-    _validate_fixed_routing_shape(
+    _validate_routing_shape(
         x_TD,
         topk_expert_ids_TK,
         topk_scores_TK,

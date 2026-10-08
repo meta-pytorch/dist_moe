@@ -148,7 +148,7 @@ def create_config(
         Validated public configuration for the example context.
     """
     return dist_moe.Config(
-        num_local_input_tokens=inputs.x_TD.shape[0],
+        max_num_local_input_tokens=inputs.x_TD.shape[0],
         hidden_dim=inputs.hidden_dim,
         intermediate_dim=inputs.intermediate_dim,
         top_k=inputs.top_k,

@@ -117,7 +117,7 @@ dist.init_process_group("nccl")
 ep_group = dist.group.WORLD
 
 config = dist_moe.Config(
-    num_local_input_tokens=4096,
+    max_num_local_input_tokens=4096,
     hidden_dim=4096,
     intermediate_dim=14336,
     top_k=8,

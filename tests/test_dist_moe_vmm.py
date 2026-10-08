@@ -45,7 +45,7 @@ def _config(**overrides: Any) -> dist_moe.Config:
         Valid public configuration suitable for memory planning.
     """
     values: dict[str, Any] = {
-        "num_local_input_tokens": 4,
+        "max_num_local_input_tokens": 4,
         "hidden_dim": 128,
         "intermediate_dim": 128,
         "top_k": 2,
@@ -192,7 +192,7 @@ class DistMoeMemoryPlanTest(unittest.TestCase):
         so the memory-planner guide remains executable guidance.
         """
         base = dist_moe.Config(
-            num_local_input_tokens=4096,
+            max_num_local_input_tokens=4096,
             hidden_dim=4096,
             intermediate_dim=14336,
             top_k=8,
@@ -303,7 +303,7 @@ class DistMoeMemoryPlanTest(unittest.TestCase):
 
         mxfp8 = dist_moe.plan_memory(
             _config(
-                num_local_input_tokens=256,
+                max_num_local_input_tokens=256,
                 activation_slot_capacity_factor=1.0,
                 block_scaled=dist_moe.BlockScaledConfig(),
             ),
@@ -316,7 +316,7 @@ class DistMoeMemoryPlanTest(unittest.TestCase):
         mxfp8_larger = dist_moe.plan_memory(
             dataclasses.replace(
                 _config(
-                    num_local_input_tokens=256,
+                    max_num_local_input_tokens=256,
                     block_scaled=dist_moe.BlockScaledConfig(),
                 ),
                 activation_slot_capacity_factor=1.5,
@@ -376,7 +376,7 @@ class DistMoeMemoryPlanTest(unittest.TestCase):
     def test_plans_blockscaled_activation_and_host_scratch(self) -> None:
         """MXFP8 uses the same activation buffer and VMM overflow accounting."""
         config = _config(
-            num_local_input_tokens=256,
+            max_num_local_input_tokens=256,
             block_scaled=dist_moe.BlockScaledConfig(
                 format=dist_moe.BlockScaledFormat.MXFP8_E4M3
             ),
@@ -976,7 +976,7 @@ class DistMoeVmmAllocationTest(unittest.TestCase):
         )
         device = torch.device("cuda", torch.cuda.current_device())
         config = _config(
-            num_local_input_tokens=256,
+            max_num_local_input_tokens=256,
             hidden_dim=128,
             intermediate_dim=8192,
             top_k=1,
@@ -1030,20 +1030,20 @@ class DistMoeVmmAllocationTest(unittest.TestCase):
             """Run one BF16 forward/backward and require host-scratch use."""
             torch.manual_seed(19)
             x_TD = torch.randn(
-                config.num_local_input_tokens,
+                config.max_num_local_input_tokens,
                 config.hidden_dim,
                 dtype=torch.bfloat16,
                 device=device,
                 requires_grad=True,
             )
             topk_expert_ids_TK = torch.zeros(
-                config.num_local_input_tokens,
+                config.max_num_local_input_tokens,
                 config.top_k,
                 dtype=torch.int64,
                 device=device,
             )
             topk_scores_TK = torch.ones(
-                config.num_local_input_tokens,
+                config.max_num_local_input_tokens,
                 config.top_k,
                 dtype=torch.float32,
                 device=device,
@@ -1106,7 +1106,7 @@ class DistMoeVmmAllocationTest(unittest.TestCase):
         )
         device = torch.device("cuda", torch.cuda.current_device())
         config = _config(
-            num_local_input_tokens=256,
+            max_num_local_input_tokens=256,
             hidden_dim=128,
             intermediate_dim=128,
             top_k=1,
@@ -1182,7 +1182,7 @@ class DistMoeVmmAllocationTest(unittest.TestCase):
         # that many rows so execution must cross into the host-backed section.
         num_tokens = 1024
         config = _config(
-            num_local_input_tokens=num_tokens,
+            max_num_local_input_tokens=num_tokens,
             hidden_dim=128,
             intermediate_dim=8192,
             top_k=1,
@@ -1281,7 +1281,7 @@ class DistMoeVmmAllocationTest(unittest.TestCase):
             format=dist_moe.BlockScaledFormat.NVFP4,
         )
         config = _config(
-            num_local_input_tokens=num_tokens,
+            max_num_local_input_tokens=num_tokens,
             hidden_dim=256,
             intermediate_dim=8192,
             top_k=1,

@@ -346,7 +346,7 @@ class DistMoeConfigTest(unittest.TestCase):
     def test_activation_slot_capacity_policy_is_unambiguous(self) -> None:
         """Reject malformed, conflicting, and inference-only slot policies."""
         base = {
-            "num_local_input_tokens": 4,
+            "max_num_local_input_tokens": 4,
             "hidden_dim": 128,
             "intermediate_dim": 128,
             "top_k": 2,
@@ -402,7 +402,7 @@ class DistMoeConfigTest(unittest.TestCase):
     def test_rejects_nonfinite_scratch_capacity_factors(self) -> None:
         """Scratch capacity factors must define finite allocation bounds."""
         base = {
-            "num_local_input_tokens": 4,
+            "max_num_local_input_tokens": 4,
             "hidden_dim": 128,
             "intermediate_dim": 128,
             "top_k": 2,
@@ -596,7 +596,7 @@ class DistMoeConfigTest(unittest.TestCase):
     def test_rejects_invalid_wgrad_dtype(self) -> None:
         """Only BF16 and FP32 weight-gradient destinations are accepted."""
         config_args = dict(
-            num_local_input_tokens=4,
+            max_num_local_input_tokens=4,
             hidden_dim=128,
             intermediate_dim=128,
             top_k=2,
@@ -678,7 +678,7 @@ class DistMoeConfigTest(unittest.TestCase):
                     ),
                 ):
                     dist_moe.Config(
-                        num_local_input_tokens=4,
+                        max_num_local_input_tokens=4,
                         hidden_dim=128,
                         intermediate_dim=128,
                         top_k=2,
@@ -712,7 +712,7 @@ class DistMoeConfigTest(unittest.TestCase):
     def test_inference_allows_zero_activation_stacks(self) -> None:
         """Inference configuration permits a scratch-only zero-stack layout."""
         config = dist_moe.Config(
-            num_local_input_tokens=4,
+            max_num_local_input_tokens=4,
             hidden_dim=128,
             intermediate_dim=128,
             top_k=2,
@@ -743,7 +743,7 @@ class DistMoeConfigTest(unittest.TestCase):
         """Inference cannot reserve unused saved-activation storage."""
         with self.assertRaisesRegex(ValueError, "does not retain saved activations"):
             dist_moe.Config(
-                num_local_input_tokens=4,
+                max_num_local_input_tokens=4,
                 hidden_dim=128,
                 intermediate_dim=128,
                 top_k=2,
@@ -758,7 +758,7 @@ class DistMoeConfigTest(unittest.TestCase):
         """BF16 expert overrides must name an exported preset."""
         with self.assertRaisesRegex(ValueError, "supported BF16 preset"):
             dist_moe.Config(
-                num_local_input_tokens=4,
+                max_num_local_input_tokens=4,
                 hidden_dim=128,
                 intermediate_dim=128,
                 top_k=2,
@@ -810,7 +810,7 @@ class DistMoeConfigTest(unittest.TestCase):
         """Reject NVFP4 training and shapes outside the kernel contract."""
         nvfp4 = dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4)
         common = {
-            "num_local_input_tokens": 4,
+            "max_num_local_input_tokens": 4,
             "intermediate_dim": 256,
             "top_k": 2,
             "num_experts": 4,
@@ -849,7 +849,7 @@ class DistMoeConfigTest(unittest.TestCase):
     def test_blockscaled_memory_plan_reports_padded_receive_capacity(self) -> None:
         """The public memory plan exposes topology-aware padded row capacity."""
         config = dist_moe.Config(
-            num_local_input_tokens=100,
+            max_num_local_input_tokens=100,
             hidden_dim=128,
             intermediate_dim=128,
             top_k=2,
@@ -866,7 +866,7 @@ class DistMoeConfigTest(unittest.TestCase):
     def test_blockscaled_uses_activation_buffer_and_vmm_controls(self) -> None:
         """Async low-precision execution shares the activation/VMM planner."""
         config = dist_moe.Config(
-            num_local_input_tokens=128,
+            max_num_local_input_tokens=128,
             hidden_dim=128,
             intermediate_dim=128,
             top_k=2,
@@ -1111,7 +1111,7 @@ class DistMoeBufferTest(unittest.TestCase):
             world_size=2,
         )
         buffers = _CommunicationBuffers.create(
-            num_local_input_tokens=4,
+            max_num_local_input_tokens=4,
             hidden_dim=128,
             top_k=2,
             group=dist.group.WORLD,
@@ -1133,7 +1133,7 @@ class DistMoeBufferTest(unittest.TestCase):
         )
         self.assertEqual(
             _routing_token_count_view(buffers.routing, 0).item(),
-            4,
+            0,
         )
 
     def test_explicit_peer_emulation_does_not_depend_on_backend_name(self) -> None:
@@ -1148,7 +1148,7 @@ class DistMoeBufferTest(unittest.TestCase):
             context = dist_moe.create_context(
                 group=dist.group.WORLD,
                 config=dist_moe.Config(
-                    num_local_input_tokens=4,
+                    max_num_local_input_tokens=4,
                     hidden_dim=128,
                     intermediate_dim=128,
                     top_k=2,
@@ -1204,7 +1204,7 @@ class DistMoeBufferTest(unittest.TestCase):
         for blockscaled in (None, dist_moe.BlockScaledConfig()):
             with self.subTest(block_scaled=blockscaled):
                 config = dist_moe.Config(
-                    num_local_input_tokens=128,
+                    max_num_local_input_tokens=128,
                     hidden_dim=128,
                     intermediate_dim=128,
                     top_k=2,
@@ -1383,7 +1383,7 @@ class DistMoeKernelTest(unittest.TestCase):
         for block_scaled in (None, dist_moe.BlockScaledConfig()):
             with self.subTest(block_scaled=block_scaled):
                 minimum = dist_moe.Config(
-                    num_local_input_tokens=num_tokens,
+                    max_num_local_input_tokens=num_tokens,
                     hidden_dim=hidden_dim,
                     intermediate_dim=intermediate_dim,
                     top_k=top_k,
@@ -1635,7 +1635,7 @@ class DistMoeKernelTest(unittest.TestCase):
             with self.subTest(block_scaled=block_scaled is not None):
                 num_tokens = 128 if block_scaled is not None else 8
                 config = dist_moe.Config(
-                    num_local_input_tokens=num_tokens,
+                    max_num_local_input_tokens=num_tokens,
                     hidden_dim=128,
                     intermediate_dim=128,
                     top_k=1,
@@ -1736,11 +1736,13 @@ class DistMoeKernelTest(unittest.TestCase):
         expert_ids = torch.arange(16, dtype=torch.int64, device="cuda").view(8, 2)
         dispatch = torch.empty_like(x)
         routing = torch.empty_like(expert_ids, dtype=torch.int16)
+        routing_token_count_1 = torch.zeros(1, dtype=torch.int32, device="cuda")
         copy_routing_and_dispatch(
             x=x,
             dispatch=dispatch,
             expert_ids=expert_ids,
             routing=routing,
+            routing_token_count_1=routing_token_count_1,
         )
 
         offset_bytes = 256
@@ -1761,6 +1763,7 @@ class DistMoeKernelTest(unittest.TestCase):
 
         torch.testing.assert_close(dispatch, x, rtol=0, atol=0)
         torch.testing.assert_close(routing, expert_ids.to(torch.int16), rtol=0, atol=0)
+        self.assertEqual(routing_token_count_1.item(), x.shape[0])
         saved = activation[offset_bytes:].view(torch.bfloat16).view_as(dispatch)
         torch.testing.assert_close(saved, dispatch, rtol=0, atol=0)
 
@@ -1773,6 +1776,60 @@ class DistMoeKernelTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
         self.assertTrue(torch.all(activation == 0xA5))
+
+    def test_fused_publication_preserves_cow_inputs_in_cuda_graph(self) -> None:
+        """Read-only publication inputs retain COW storage in eager and replay."""
+        x_base = torch.randn(8, 128, dtype=torch.bfloat16, device="cuda")
+        expert_ids_base = torch.arange(16, dtype=torch.int64, device="cuda").view(8, 2)
+        x = x_base._lazy_clone()
+        expert_ids = expert_ids_base._lazy_clone()
+        dispatch = torch.empty_like(x)
+        routing = torch.empty_like(expert_ids, dtype=torch.int16)
+        routing_token_count_1 = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+        def read_only_data_ptr(tensor: torch.Tensor) -> int:
+            return torch._C._data_address(tensor) + (
+                tensor.storage_offset() * tensor.element_size()
+            )
+
+        x_ptr = read_only_data_ptr(x)
+        expert_ids_ptr = read_only_data_ptr(expert_ids)
+
+        def publish() -> None:
+            copy_routing_and_dispatch(
+                x=x,
+                dispatch=dispatch,
+                expert_ids=expert_ids,
+                routing=routing,
+                routing_token_count_1=routing_token_count_1,
+            )
+
+        publish()  # Compile before capture and exercise the eager boundary.
+        torch.cuda.synchronize()
+
+        def assert_publication() -> None:
+            self.assertTrue(torch._C._is_cow_tensor(x))
+            self.assertTrue(torch._C._is_cow_tensor(expert_ids))
+            self.assertEqual(read_only_data_ptr(x), x_ptr)
+            self.assertEqual(read_only_data_ptr(expert_ids), expert_ids_ptr)
+            torch.testing.assert_close(dispatch, x, rtol=0, atol=0)
+            torch.testing.assert_close(
+                routing, expert_ids.to(torch.int16), rtol=0, atol=0
+            )
+            self.assertEqual(routing_token_count_1.item(), x.shape[0])
+
+        assert_publication()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            publish()
+
+        dispatch.zero_()
+        routing.zero_()
+        routing_token_count_1.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_publication()
 
     def _assert_planner_reset(self, activation_buffer: ActivationBuffer) -> None:
         """Assert that backward restored the BF16 activation planner.
@@ -1871,7 +1928,7 @@ class DistMoeKernelTest(unittest.TestCase):
         context = dist_moe.create_context(
             group=dist.group.WORLD,
             config=dist_moe.Config(
-                num_local_input_tokens=num_tokens,
+                max_num_local_input_tokens=num_tokens,
                 hidden_dim=hidden_dim,
                 intermediate_dim=intermediate_dim,
                 top_k=top_k,
@@ -1890,47 +1947,51 @@ class DistMoeKernelTest(unittest.TestCase):
         self.addCleanup(context.close)
         return context, (x_a, ids_a, scores_a), (x_b, ids_b, scores_b), w13, w2
 
-    def test_context_requires_fixed_shape_and_supports_logical_padding(self) -> None:
-        """Reject short tensors while zero-score padding preserves real rows."""
+    def test_context_accepts_bounded_token_shapes(self) -> None:
+        """Reuse one training context from one row through its capacity."""
         context, case_a, _, w13, w2 = self._create_case(inference=False)
-        short_x_TD, short_expert_ids_TK, short_scores_TK = (
-            tensor[:4].contiguous() for tensor in case_a
-        )
+        for num_tokens in (1, 4, 8):
+            with self.subTest(num_tokens=num_tokens):
+                x_TD, expert_ids_TK, scores_TK = (
+                    tensor[:num_tokens].contiguous() for tensor in case_a
+                )
+                actual_TD = dist_moe.routed_experts(
+                    x_TD,
+                    expert_ids_TK,
+                    scores_TK,
+                    w13,
+                    w2,
+                    context,
+                )
+                expected_TD = _reference_moe(
+                    x_TD,
+                    expert_ids_TK,
+                    scores_TK,
+                    w13,
+                    w2,
+                )
+                torch.testing.assert_close(
+                    actual_TD,
+                    expected_TD,
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
 
-        with self.assertRaisesRegex(ValueError, "must equal"):
-            dist_moe.routed_experts(
-                short_x_TD,
-                short_expert_ids_TK,
-                short_scores_TK,
-                w13,
-                w2,
-                context,
-            )
+        for invalid_tokens in (0, 9):
+            with self.subTest(invalid_tokens=invalid_tokens):
+                tensors = tuple(
+                    (
+                        tensor[:0]
+                        if invalid_tokens == 0
+                        else torch.cat((tensor, tensor[:1]), dim=0)
+                    ).contiguous()
+                    for tensor in case_a
+                )
+                with self.assertRaisesRegex(ValueError, "must be in"):
+                    dist_moe.routed_experts(*tensors, w13, w2, context)
 
-        padded_x_TD, padded_expert_ids_TK, padded_scores_TK = (
-            tensor.clone() for tensor in case_a
-        )
-        padded_scores_TK[4:] = 0
-        actual_TD = dist_moe.routed_experts(
-            padded_x_TD,
-            padded_expert_ids_TK,
-            padded_scores_TK,
-            w13,
-            w2,
-            context,
-        )
-        expected_TD = _reference_moe(
-            padded_x_TD[:4],
-            padded_expert_ids_TK[:4],
-            padded_scores_TK[:4],
-            w13,
-            w2,
-        )
-        torch.testing.assert_close(actual_TD[:4], expected_TD, rtol=2e-2, atol=2e-2)
-        self.assertEqual(torch.count_nonzero(actual_TD[4:]).item(), 0)
-
-    def test_prepared_weights_validate_fixed_shape_before_dispatch(self) -> None:
-        """Reject short prepared-MXFP8 calls before block-scaled execution."""
+    def test_prepared_weights_accept_bounded_token_shape(self) -> None:
+        """Prepared MXFP8 inference accepts a call below context capacity."""
         policy = dist_moe.BlockScaledConfig()
         context, case_a, _, w13_EFD, w2_EDF = self._create_case(
             inference=True,
@@ -1950,11 +2011,8 @@ class DistMoeKernelTest(unittest.TestCase):
             inference=True,
         )
 
-        with (
-            mock.patch.object(blockscaled_impl, "_run_blockscaled") as run_blockscaled,
-            self.assertRaisesRegex(ValueError, "must equal"),
-        ):
-            dist_moe.routed_experts(
+        with torch.no_grad():
+            actual_TD = dist_moe.routed_experts(
                 short_x_TD,
                 short_expert_ids_TK,
                 short_scores_TK,
@@ -1962,7 +2020,7 @@ class DistMoeKernelTest(unittest.TestCase):
                 prepared_w2,
                 context,
             )
-        run_blockscaled.assert_not_called()
+        self.assertEqual(actual_TD.shape, short_x_TD.shape)
 
     def test_mxfp8_staged_and_mega_inference_match_reference(self) -> None:
         """Match staged/Mega MXFP8 inference to the dense reference.
@@ -3132,7 +3190,7 @@ class DistMoeKernelTest(unittest.TestCase):
         context = dist_moe.create_context(
             group=dist.group.WORLD,
             config=dist_moe.Config(
-                num_local_input_tokens=num_tokens,
+                max_num_local_input_tokens=num_tokens,
                 hidden_dim=hidden_dim,
                 intermediate_dim=intermediate_dim,
                 top_k=top_k,
@@ -3545,35 +3603,37 @@ class DistMoeKernelTest(unittest.TestCase):
                 training_TD.backward(torch.randn_like(training_TD))
                 self._assert_planner_reset(activation_buffer)
 
-    def test_inference_cuda_graph_replays_changed_inputs(self) -> None:
-        """CUDA graph replay consumes updated token and routing buffers."""
+    def test_inference_cuda_graphs_replay_bounded_shapes(self) -> None:
+        """One context backs fixed CUDA graphs at multiple bounded T values."""
         context, case_a, case_b, w13, w2 = self._create_case()
-        static_x, static_ids, static_scores = (tensor.clone() for tensor in case_a)
-
-        # Compile and initialize every lazy kernel before capture.
-        dist_moe.routed_experts(static_x, static_ids, static_scores, w13, w2, context)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured_output = dist_moe.routed_experts(
-                static_x,
-                static_ids,
-                static_scores,
-                w13,
-                w2,
-                context,
+        captures = []
+        for num_tokens in (4, 8):
+            static_inputs = tuple(
+                tensor[:num_tokens].contiguous().clone() for tensor in case_a
             )
-
-        for x, ids, scores in (case_a, case_b):
-            static_x.copy_(x)
-            static_ids.copy_(ids)
-            static_scores.copy_(scores)
-            graph.replay()
+            dist_moe.routed_experts(*static_inputs, w13, w2, context)
             torch.cuda.synchronize()
-            actual = captured_output.clone()
-            expected = _reference_moe(x, ids, scores, w13, w2)
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-            self.assertLess(_relative_l2(actual, expected), 5e-3)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured_output = dist_moe.routed_experts(
+                    *static_inputs,
+                    w13,
+                    w2,
+                    context,
+                )
+            captures.append((num_tokens, static_inputs, graph, captured_output))
+
+        for num_tokens, static_inputs, graph, captured_output in captures:
+            for values in (case_a, case_b):
+                inputs = tuple(tensor[:num_tokens].contiguous() for tensor in values)
+                for static, value in zip(static_inputs, inputs, strict=True):
+                    static.copy_(value)
+                graph.replay()
+                torch.cuda.synchronize()
+                actual = captured_output.clone()
+                expected = _reference_moe(*inputs, w13, w2)
+                torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+                self.assertLess(_relative_l2(actual, expected), 5e-3)
 
     def _run_nvfp4_inference_cuda_graph_replay(
         self,
@@ -3704,7 +3764,7 @@ class DistMoeKernelTest(unittest.TestCase):
             * intermediate_dim**-0.5
         ).requires_grad_()
         config = dist_moe.Config(
-            num_local_input_tokens=num_tokens,
+            max_num_local_input_tokens=num_tokens,
             hidden_dim=hidden_dim,
             intermediate_dim=intermediate_dim,
             top_k=top_k,
@@ -3997,6 +4057,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
         repeat_execution: bool = False,
         accumulate_execution: bool = False,
         parameter_grad_dtype: torch.dtype = torch.bfloat16,
+        max_num_tokens: int | None = None,
     ) -> None:
         """Run one precision through real peer dispatch and combine paths.
 
@@ -4014,6 +4075,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
             accumulate_execution: Whether to accumulate a second identical
                 backward into the existing expert gradients.
             parameter_grad_dtype: Dtype declared by both expert parameters.
+            max_num_tokens: Optional context capacity above the actual input T.
         """
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
@@ -4094,7 +4156,9 @@ class DistMoeTwoRankTest(unittest.TestCase):
             w2 = w2.detach()
 
         common_config = {
-            "num_local_input_tokens": num_tokens,
+            "max_num_local_input_tokens": (
+                num_tokens if max_num_tokens is None else max_num_tokens
+            ),
             "hidden_dim": hidden_dim,
             "intermediate_dim": intermediate_dim,
             "top_k": top_k,
@@ -4352,6 +4416,16 @@ class DistMoeTwoRankTest(unittest.TestCase):
         combine without involving VMM.
         """
         self._run_two_rank_numerics(None, repeat_execution=True)
+
+    @with_comms
+    def test_bounded_token_shape_exercises_peer_paths(self) -> None:
+        """Run actual T below one BF16/MXFP8 context capacity over NCCL."""
+        for block_scaled in (None, dist_moe.BlockScaledConfig()):
+            with self.subTest(block_scaled=block_scaled is not None):
+                self._run_two_rank_numerics(
+                    block_scaled,
+                    max_num_tokens=256,
+                )
 
     @with_comms
     def test_bf16_clip_statistics_exercise_peer_paths(self) -> None:

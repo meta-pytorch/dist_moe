@@ -37,7 +37,7 @@ Pages do not migrate and the CPU never participates in an execution-time copy.
 the allocation. It derives:
 
 ```text
-balanced_recv_rows = num_local_input_tokens * top_k
+balanced_recv_rows = max_num_local_input_tokens * top_k
 device_scratch_capacity_rows = topology-aware padded rows at device imbalance factor
 total_scratch_capacity_rows = topology-aware padded rows at VMM imbalance factor
 minimum activation slot = mandatory inputs for every layer sharing the slot
@@ -59,7 +59,7 @@ reimplementing this topology-aware calculation.
 also resolves CUDA VMM granularity, physical section padding, and the allocator
 size-class adjustment used by `dist_moe.create_context()`.
 
-For example, `num_local_input_tokens=4096`, `top_k=8`, EP 16, device
+For example, `max_num_local_input_tokens=4096`, `top_k=8`, EP 16, device
 factor 1.5, and total factor 16 produce 32,768 balanced rows, 49,152
 device-scratch rows, and 524,288 total scratch rows. The exact byte counts also
 depend on hidden/intermediate dimensions and forward/backward precision; obtain

@@ -144,7 +144,7 @@ ep_size = dist.get_world_size(ep_group)
 E = E_local * ep_size
 
 config = dist_moe.Config(
-    num_local_input_tokens=T,
+    max_num_local_input_tokens=T,
     hidden_dim=D,
     intermediate_dim=F,
     top_k=K,
@@ -262,14 +262,13 @@ detailed BF16 and MXFP8 guides show every kernel and saved value.
 The context is collective to create, sequentially reusable, and not reentrant.
 All expert-parallel ranks must create matching contexts in the same order.
 
-`Config.num_local_input_tokens` is one fixed physical shape, not a maximum.
-Every rank and every invocation using the context must pass exactly that many
-rows. If a rank has fewer logical tokens, pad its inputs, assign zero routing
-scores to padded rows, and slice the returned output. Unequal physical token
-counts across expert-parallel ranks trigger a device-side trap before routing
-metadata is generated. That failure terminates the distributed iteration and
-invalidates the CUDA execution context; it is not a recoverable Python input
-error.
+`Config.max_num_local_input_tokens` is the context's allocation capacity. Each
+invocation may pass any physical row count `T` in
+`[1, max_num_local_input_tokens]`, and different invocations may use different
+counts. Every expert-parallel rank must use the same `T` for one invocation;
+unequal counts trigger a device-side trap before routing metadata is generated.
+That failure terminates the distributed iteration and invalidates the CUDA
+execution context; it is not a recoverable Python input error.
 
 <a id="choose-a-precision-and-pipeline"></a>
 ## Choose a precision and pipeline
@@ -304,7 +303,7 @@ policy = dist_moe.BlockScaledConfig(
     pipeline="staged",
 )
 config = dist_moe.Config(
-    num_local_input_tokens=T,
+    max_num_local_input_tokens=T,
     hidden_dim=D,
     intermediate_dim=F,
     top_k=K,
@@ -335,7 +334,7 @@ policy = dist_moe.BlockScaledConfig(
     pipeline="staged",
 )
 config = dist_moe.Config(
-    num_local_input_tokens=T,
+    max_num_local_input_tokens=T,
     hidden_dim=D,
     intermediate_dim=F,
     top_k=K,
@@ -362,7 +361,7 @@ python examples/memory_planning.py
 
 ```python
 config = dist_moe.Config(
-    num_local_input_tokens=4,
+    max_num_local_input_tokens=4,
     hidden_dim=128,
     intermediate_dim=128,
     top_k=2,

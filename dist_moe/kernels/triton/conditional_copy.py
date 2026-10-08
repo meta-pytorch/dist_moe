@@ -20,6 +20,30 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    from torch._native.const_tensor_wrapper import (
+        ConstTensorWrapper as _ReadOnlyTritonTensor,
+    )
+except ImportError:
+
+    class _ReadOnlyTritonTensor:
+        """Backport PyTorch's read-only Triton tensor protocol."""
+
+        __slots__ = ("_tensor",)
+
+        def __init__(self, tensor: torch.Tensor) -> None:
+            self._tensor = tensor
+
+        @property
+        def dtype(self) -> torch.dtype:
+            return self._tensor.dtype
+
+        def data_ptr(self) -> int:
+            return torch._C._data_address(self._tensor) + (
+                self._tensor.storage_offset() * self._tensor.element_size()
+            )
+
+
 from ..._activation_buffer_planner_kernel import (
     MEMORY_ALIGNMENT_TL_CONSTEXPR,
 )
@@ -72,22 +96,14 @@ def _validate_activation_destination(
         raise ValueError("activation_offset must be on the input device")
 
 
-def copy_routing_and_dispatch(
+def _validate_routing_publication(
     *,
-    x: torch.Tensor,
-    dispatch: torch.Tensor,
     expert_ids: torch.Tensor,
     routing: torch.Tensor,
+    routing_token_count_1: torch.Tensor,
+    device: torch.device,
 ) -> None:
-    """Publish dense dispatch inputs and routing IDs in one launch."""
-    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("x must have dtype float16, bfloat16, or float32")
-    if x.ndim != 2:
-        raise ValueError("x must be two-dimensional")
-    if not dispatch.is_contiguous():
-        raise ValueError("dispatch must be contiguous")
-    if dispatch.shape != x.shape or dispatch.dtype != x.dtype:
-        raise ValueError("dispatch must match x shape and dtype")
+    """Validate views used to publish one rank's routing metadata."""
     if expert_ids.dtype not in (torch.int16, torch.int32, torch.int64):
         raise TypeError("expert_ids must have an integer dtype")
     if expert_ids.ndim != 2:
@@ -96,24 +112,59 @@ def copy_routing_and_dispatch(
         raise ValueError("routing must match expert_ids shape and have dtype int16")
     if not routing.is_contiguous():
         raise ValueError("routing must be contiguous")
-    if not all(tensor.device == x.device for tensor in (dispatch, expert_ids, routing)):
-        raise ValueError("publication tensors must be on the input device")
+    if (
+        routing_token_count_1.shape != (1,)
+        or routing_token_count_1.dtype != torch.int32
+    ):
+        raise ValueError("routing_token_count_1 must be an int32 tensor with shape [1]")
+    if not all(
+        tensor.device == device
+        for tensor in (expert_ids, routing, routing_token_count_1)
+    ):
+        raise ValueError("routing publication tensors must be on the input device")
 
+
+def copy_routing_and_dispatch(
+    *,
+    x: torch.Tensor,
+    dispatch: torch.Tensor,
+    expert_ids: torch.Tensor,
+    routing: torch.Tensor,
+    routing_token_count_1: torch.Tensor,
+) -> None:
+    """Publish actual T, routing IDs, and dense dispatch input in one launch."""
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("x must have dtype float16, bfloat16, or float32")
+    if x.ndim != 2:
+        raise ValueError("x must be two-dimensional")
+    if not dispatch.is_contiguous():
+        raise ValueError("dispatch must be contiguous")
+    if dispatch.shape != x.shape or dispatch.dtype != x.dtype:
+        raise ValueError("dispatch must match x shape and dtype")
+    _validate_routing_publication(
+        expert_ids=expert_ids,
+        routing=routing,
+        routing_token_count_1=routing_token_count_1,
+        device=x.device,
+    )
+    if dispatch.device != x.device:
+        raise ValueError("dispatch must be on the input device")
     num_elements = max(x.numel(), expert_ids.numel())
-    if num_elements == 0:
-        return
-
     grid = (triton.cdiv(num_elements, _COPY_BLOCK_SIZE),)
     _triton_copy_routing_and_dispatch[grid](
-        x_ptr=x,
+        # Triton otherwise calls mutable data_ptr(), which materializes COW
+        # inputs and changes their address during CUDA-graph capture.
+        x_ptr=_ReadOnlyTritonTensor(x),
         dispatch_ptr=dispatch,
-        expert_ids_ptr=expert_ids,
+        expert_ids_ptr=_ReadOnlyTritonTensor(expert_ids),
         routing_ptr=routing,
+        routing_token_count_ptr=routing_token_count_1,
         x_num_elements=x.numel(),
         x_num_cols=x.shape[1],
         x_stride_0=x.stride(0),
         x_stride_1=x.stride(1),
         routing_num_elements=expert_ids.numel(),
+        routing_num_rows=expert_ids.shape[0],
         routing_num_cols=expert_ids.shape[1],
         routing_stride_0=expert_ids.stride(0),
         routing_stride_1=expert_ids.stride(1),
@@ -191,11 +242,13 @@ def _triton_copy_routing_and_dispatch(
     dispatch_ptr,
     expert_ids_ptr,
     routing_ptr,
+    routing_token_count_ptr,
     x_num_elements,
     x_num_cols,
     x_stride_0,
     x_stride_1,
     routing_num_elements,
+    routing_num_rows,
     routing_num_cols,
     routing_stride_0,
     routing_stride_1,
@@ -217,6 +270,11 @@ def _triton_copy_routing_and_dispatch(
     routing_offsets = routing_rows * routing_stride_0 + routing_cols * routing_stride_1
     expert_ids = tl.load(expert_ids_ptr + routing_offsets, mask=routing_mask)
     tl.store(routing_ptr + offsets, expert_ids, mask=routing_mask)
+    tl.store(
+        routing_token_count_ptr + offsets,
+        routing_num_rows,
+        mask=offsets == 0,
+    )
 
 
 def conditional_copy_activations(

@@ -3,7 +3,7 @@
 import dist_moe
 
 config = dist_moe.Config(
-    num_local_input_tokens=4,
+    max_num_local_input_tokens=4,
     hidden_dim=128,
     intermediate_dim=128,
     top_k=2,

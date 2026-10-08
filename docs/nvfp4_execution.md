@@ -32,7 +32,7 @@ policy = dist_moe.BlockScaledConfig(
     pipeline="staged",  # or "mega"
 )
 config = dist_moe.Config(
-    num_local_input_tokens=T,
+    max_num_local_input_tokens=T,
     hidden_dim=D,
     intermediate_dim=F,
     top_k=K,
@@ -223,7 +223,7 @@ Construction or invocation fails before kernel execution when:
 - a dimension violates NVFP4 alignment or supported maxima;
 - either weight is not a prepared NVFP4 operand;
 - required global scales or reciprocal scales are absent or malformed;
-- input tokens differ from the fixed `num_local_input_tokens`; or
+- input tokens exceed `max_num_local_input_tokens`; or
 - the selected scratch capacity cannot represent the configured receive bound.
 
 These checks prevent an unsupported training path, an incorrectly packed row,

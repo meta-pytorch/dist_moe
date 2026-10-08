@@ -50,6 +50,7 @@ from ._buffers import (
     _CommunicationBuffers,
     _initialize_fake_peer_scatter_output,
     _routing_ids_view,
+    _routing_token_count_view,
     SymmetricMemoryBuffer,
 )
 from ._context import _get_context, _reshape_weights
@@ -1429,12 +1430,17 @@ class _BlockScaledAutograd(torch.autograd.Function):
         local_routing_buffer = _routing_ids_view(
             routing_buffer, local_rank, topk_expert_ids_TK.shape
         )
+        routing_token_count_1 = _routing_token_count_view(
+            routing_buffer,
+            local_rank,
+        )
 
         with record_function("moe_preprocess"):
             assert x_TD.ndim == 2
             dispatch_stride_bytes = None
             if inference_mode or blockscaled_dispatch:
                 local_routing_buffer.copy_(topk_expert_ids_TK)
+                routing_token_count_1.fill_(topk_expert_ids_TK.shape[0])
                 dispatch_stride_bytes = _stage_async_inference_dispatch(
                     x_TD,
                     dispatch_buffer,
@@ -1451,6 +1457,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     dispatch=dispatch_buffer_local,
                     expert_ids=topk_expert_ids_TK,
                     routing=local_routing_buffer,
+                    routing_token_count_1=routing_token_count_1,
                 )
             # Routing metadata and dispatch rows become peer-visible together,
             # so downstream routing and GEMM need no second rendezvous.

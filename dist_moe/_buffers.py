@@ -524,11 +524,13 @@ class _CommunicationBuffers:
 
     Args:
         routing: Symmetric int16 storage containing a fixed routing header
-            followed by ``[num_local_input_tokens, top_k]`` expert IDs.
+            followed by ``[max_num_local_input_tokens, top_k]`` expert-ID
+            capacity.
         dispatch: Symmetric BF16 source-activation and DGRAD storage with
-            capacity ``[num_local_input_tokens, top_k, hidden_dim]``.
+            capacity ``[max_num_local_input_tokens, top_k, hidden_dim]``.
         combine: Symmetric BF16 route-output and route-gradient storage with
-            the same ``[num_local_input_tokens, top_k, hidden_dim]`` capacity.
+            the same ``[max_num_local_input_tokens, top_k, hidden_dim]``
+            capacity.
     """
 
     routing: SymmetricMemoryBuffer
@@ -572,7 +574,7 @@ class _CommunicationBuffers:
     def create(
         cls,
         *,
-        num_local_input_tokens: int,
+        max_num_local_input_tokens: int,
         hidden_dim: int,
         top_k: int,
         group: dist.ProcessGroup,
@@ -582,7 +584,8 @@ class _CommunicationBuffers:
         """Create all communication buffers required by distributed MoE.
 
         Args:
-            num_local_input_tokens: Fixed physical input tokens on every rank.
+            max_num_local_input_tokens: Maximum physical input tokens accepted
+                from every rank.
             hidden_dim: Model hidden dimension.
             top_k: Number of selected experts per token.
             group: Expert-parallel process group.
@@ -598,26 +601,26 @@ class _CommunicationBuffers:
         if emulate_peer_buffers is None:
             emulate_peer_buffers = is_fake_process_group(group)
         routing = SymmetricMemoryBuffer.create(
-            (_ROUTING_HEADER_INT16_ELEMENTS + num_local_input_tokens * top_k,),
+            (_ROUTING_HEADER_INT16_ELEMENTS + max_num_local_input_tokens * top_k,),
             torch.int16,
             group,
             device,
             emulate_peer_buffers=emulate_peer_buffers,
         )
-        _routing_token_count_view(routing, routing.hdl.rank).fill_(
-            num_local_input_tokens
-        )
+        # Every invocation publishes its actual T before the EP barrier. Zero
+        # is an invalid-call sentinel if a future path omits publication.
+        _routing_token_count_view(routing, routing.hdl.rank).zero_()
         return cls._from_buffers(
             routing=routing,
             dispatch=SymmetricMemoryBuffer.create(
-                (num_local_input_tokens, top_k, hidden_dim),
+                (max_num_local_input_tokens, top_k, hidden_dim),
                 torch.bfloat16,
                 group,
                 device,
                 emulate_peer_buffers=emulate_peer_buffers,
             ),
             combine=SymmetricMemoryBuffer.create(
-                (num_local_input_tokens, top_k, hidden_dim),
+                (max_num_local_input_tokens, top_k, hidden_dim),
                 torch.bfloat16,
                 group,
                 device,
@@ -630,7 +633,7 @@ def _routing_token_count_view(
     routing: SymmetricMemoryBuffer,
     rank: int,
 ) -> torch.Tensor:
-    """Return one peer's fixed local-token-count header view.
+    """Return one peer's per-invocation local-token-count header view.
 
     Args:
         routing: Routing symmetric allocation.

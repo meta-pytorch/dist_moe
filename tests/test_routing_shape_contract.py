@@ -18,7 +18,6 @@ import dist_moe
 import pytest
 import torch
 import torch.distributed as dist
-from dist_moe._buffers import _routing_token_count_view
 
 _EXPECTED_TRAP_ERRORS = (
     "device-side assert",
@@ -72,14 +71,15 @@ def _make_inputs(
 
 
 def _run_mismatched_worker(*, inference: bool) -> None:
-    """Corrupt one peer header and require the routing kernel to trap."""
+    """Pass unequal physical T and require every routing kernel to trap."""
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     dist.init_process_group("nccl")
-    num_tokens, hidden_dim, intermediate_dim = 4, 128, 128
+    max_num_tokens, hidden_dim, intermediate_dim = 4, 128, 128
+    num_tokens = max_num_tokens - int(local_rank == 1)
     config = dist_moe.Config(
-        num_local_input_tokens=num_tokens,
+        max_num_local_input_tokens=max_num_tokens,
         hidden_dim=hidden_dim,
         intermediate_dim=intermediate_dim,
         top_k=1,
@@ -94,12 +94,6 @@ def _run_mismatched_worker(*, inference: bool) -> None:
         config=config,
         device=device,
     )
-    if local_rank == 1:
-        _routing_token_count_view(context.buffers.routing, local_rank).fill_(
-            num_tokens + 1
-        )
-    dist.barrier()
-
     x_TD, topk_expert_ids_TK, topk_scores_TK, w13_EFD, w2_EDF = _make_inputs(
         num_tokens=num_tokens,
         hidden_dim=hidden_dim,
@@ -150,7 +144,7 @@ def _run_capacity_overflow_worker(*, block_scaled: bool) -> None:
     num_tokens = 512 if block_scaled else 8
     hidden_dim = intermediate_dim = 256 if block_scaled else 128
     config = dist_moe.Config(
-        num_local_input_tokens=num_tokens,
+        max_num_local_input_tokens=num_tokens,
         hidden_dim=hidden_dim,
         intermediate_dim=intermediate_dim,
         top_k=1,
