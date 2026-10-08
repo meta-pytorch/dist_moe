@@ -80,6 +80,7 @@ from ._triton_ops import (
     conditional_copy_activations,
     copy_activation_to_dispatch,
     copy_dispatch_to_activation,
+    copy_routing,
     copy_routing_and_dispatch,
     reduce_from_topk,
     symmetric_memory_barrier,
@@ -1283,6 +1284,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
         swiglu_limit: float = 7.0,
         activation_slot_id_1: torch.Tensor | None = None,
         num_moe_layers_in_slot: int | None = None,
+        validate_expert_ids: bool = False,
     ) -> torch.Tensor:
         """Forward pass with routing.
 
@@ -1333,6 +1335,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
             activation_slot_id_1: Device scalar selecting the activation slot.
             num_moe_layers_in_slot: Static layer count used to bound the
                 selected pipeline activation slot.
+            validate_expert_ids: Whether publication validates expert-ID bounds.
 
         Returns:
             Combined local output activations with shape ``[T, D]``.
@@ -1439,8 +1442,13 @@ class _BlockScaledAutograd(torch.autograd.Function):
             assert x_TD.ndim == 2
             dispatch_stride_bytes = None
             if inference_mode or blockscaled_dispatch:
-                local_routing_buffer.copy_(topk_expert_ids_TK)
-                routing_token_count_1.fill_(topk_expert_ids_TK.shape[0])
+                copy_routing(
+                    expert_ids=topk_expert_ids_TK,
+                    routing=local_routing_buffer,
+                    routing_token_count_1=routing_token_count_1,
+                    num_experts=num_experts,
+                    validate_expert_ids=validate_expert_ids,
+                )
                 dispatch_stride_bytes = _stage_async_inference_dispatch(
                     x_TD,
                     dispatch_buffer,
@@ -1458,6 +1466,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     expert_ids=topk_expert_ids_TK,
                     routing=local_routing_buffer,
                     routing_token_count_1=routing_token_count_1,
+                    num_experts=num_experts,
+                    validate_expert_ids=validate_expert_ids,
                 )
             # Routing metadata and dispatch rows become peer-visible together,
             # so downstream routing and GEMM need no second rendezvous.
@@ -2343,7 +2353,10 @@ class _BlockScaledAutograd(torch.autograd.Function):
             # Barrier before consuming dgrad_combine output
             _ep_barrier(dispatch_buffer)
 
-            grad_x_TD = reduce_from_topk(grad_x_gathered)
+            grad_x_TD = reduce_from_topk(
+                grad_x_gathered,
+                expert_ids=topk_expert_ids_TK,
+            )
             del grad_x_gathered
 
         # 7. Restore logical weight shapes and suppress gradients whose storage
@@ -2362,7 +2375,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
             grad_topk_scores_TK,
             None if external_wgrad_destination else grad_w13_EFD,
             None if external_wgrad_destination else grad_w2_EDF,
-            *((None,) * 36),
+            *((None,) * 37),
         )
 
 
@@ -2446,6 +2459,8 @@ def _run_blockscaled_eager(
     swiglu_limit: float = 7.0,
     activation_slot_id_1: torch.Tensor | None = None,
     num_moe_layers_in_slot: int | None = None,
+    validate_expert_ids: bool = False,
+    zero_out_padded_callback_inputs: bool = False,
 ) -> torch.Tensor:
     """Run eager block-scaled distributed MoE with SwiGLU activation.
 
@@ -2491,6 +2506,9 @@ def _run_blockscaled_eager(
         activation_slot_id_1: Optional graph-stable activation-stack index.
         num_moe_layers_in_slot: Static number of MoE layers sharing the
             selected activation slot.
+        validate_expert_ids: Whether publication validates expert-ID bounds.
+        zero_out_padded_callback_inputs: Whether invalid callback inputs are
+            zeroed before invoking user code.
         inplace_wgrad_accum: Whether serialized eager backward calls may fuse
             WGRAD into the standard parameter gradient.
         wgrad_parameter_owners: Optional outer W13 and W2 parameters whose
@@ -2599,8 +2617,10 @@ def _run_blockscaled_eager(
     postprocess = _resolve_experts_output_postprocess_fn(
         experts_postprocess_fn,
         x_TD=x_TD,
+        topk_expert_ids_TK=topk_expert_ids_TK,
         topk_scores_TK=topk_scores_TK,
         inference_mode=inference_mode,
+        zero_out_padded_callback_inputs=zero_out_padded_callback_inputs,
     )
     _validate_fused_blockscaled_mode(
         blockscaled_cfg,
@@ -2665,6 +2685,7 @@ def _run_blockscaled_eager(
             else activation_slot_id_1
         ),
         _num_moe_layers_in_selected_slot,
+        validate_expert_ids,
     )
 
 
@@ -3097,6 +3118,7 @@ def _run_async_forward(
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
     save_for_backward: bool,
+    validate_expert_ids: bool,
 ) -> torch.Tensor:
     """Invoke the asynchronous forward implementation.
 
@@ -3113,6 +3135,7 @@ def _run_async_forward(
         activation_slot_id_1: Device scalar selecting activation storage.
         num_moe_layers_in_slot: Static MoE-layer depth of the selected slot.
         save_for_backward: Whether this invocation has a backward consumer.
+        validate_expert_ids: Whether publication validates expert-ID bounds.
 
     Returns:
         Local combined expert output with shape ``[T, D]``.
@@ -3175,6 +3198,7 @@ def _run_async_forward(
         swiglu_limit=context.config.swiglu_limit,
         activation_slot_id_1=activation_slot_id_1,
         num_moe_layers_in_slot=num_moe_layers_in_slot,
+        validate_expert_ids=validate_expert_ids,
     )
 
 
@@ -3202,6 +3226,7 @@ def _block_scaled_forward_op(
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
     save_for_backward: bool,
+    validate_expert_ids: bool,
     context_id: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Run async MXFP8 forward and expose fixed-shape backward metadata.
@@ -3225,6 +3250,7 @@ def _block_scaled_forward_op(
         activation_slot_id_1: Device scalar selecting activation storage.
         num_moe_layers_in_slot: Static MoE-layer depth of the selected slot.
         save_for_backward: Whether this invocation has a backward consumer.
+        validate_expert_ids: Whether publication validates expert-ID bounds.
         context_id: Registered DistMoE context identifier.
 
     Returns:
@@ -3255,6 +3281,7 @@ def _block_scaled_forward_op(
     postprocess = _resolve_experts_output_postprocess_fn(
         postprocess_config,
         x_TD=x_TD,
+        topk_expert_ids_TK=topk_expert_ids_TK,
         topk_scores_TK=topk_scores_TK,
     )
     output_TD = _run_async_forward(
@@ -3270,6 +3297,7 @@ def _block_scaled_forward_op(
         activation_slot_id_1,
         num_moe_layers_in_slot,
         save_for_backward,
+        validate_expert_ids,
     )
     if not save_for_backward:
         return output_TD, _block_scaled_forward_metadata(
@@ -3328,6 +3356,7 @@ def _block_scaled_forward_fake(
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
     save_for_backward: bool,
+    validate_expert_ids: bool,
     context_id: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Return fake async-forward outputs without reading tensor data.
@@ -3351,6 +3380,7 @@ def _block_scaled_forward_fake(
         activation_slot_id_1: Fake device activation-slot scalar.
         num_moe_layers_in_slot: Static MoE-layer depth of the selected slot.
         save_for_backward: Whether the fixed state has a backward consumer.
+        validate_expert_ids: Debug validation policy, unused by fake execution.
         context_id: Registered DistMoE context identifier.
 
     Returns:
@@ -3366,6 +3396,7 @@ def _block_scaled_forward_fake(
         rmsnorm_use_kahan,
         activation_slot_id_1,
         num_moe_layers_in_slot,
+        validate_expert_ids,
     )
     return torch.empty_like(x_TD), _block_scaled_forward_metadata(
         x_TD,
@@ -3465,6 +3496,7 @@ def _run_block_scaled_registered_backward(
     postprocess = _resolve_experts_output_postprocess_fn(
         postprocess_config,
         x_TD=grad_output_TD,
+        topk_expert_ids_TK=topk_expert_ids_TK,
         topk_scores_TK=topk_scores_TK,
     )
     weights = list(state[_BACKWARD_WEIGHT_STATE])
@@ -3794,6 +3826,7 @@ def _block_scaled_setup_context(
         _activation_slot_id_1,
         _num_moe_layers_in_slot,
         _save_for_backward,
+        _validate_expert_ids,
         context_id,
     ) = inputs
     assert isinstance(prepared, list)
@@ -3973,6 +4006,7 @@ def _block_scaled_autograd_backward(
         None,  # activation_slot_id_1
         None,  # num_moe_layers_in_slot
         None,  # save_for_backward
+        None,  # validate_expert_ids
         None,  # context_id
     )
 
@@ -4070,6 +4104,7 @@ class _RegisteredBlockScaledAutograd(torch.autograd.Function):
             activation_slot_id_1,
             num_moe_layers_in_slot,
             True,
+            options.validate_expert_ids,
             context_id,
         )
         output = _block_scaled_forward_op(*forward_args)
@@ -4213,6 +4248,7 @@ def _run_blockscaled(
             activation_buffer.activation_slot_id_1,
             activation_buffer._num_moe_layers_in_selected_slot,
             save_for_backward,
+            options.validate_expert_ids,
             context.context_id,
         )
         return output_TD
@@ -4273,4 +4309,6 @@ def _run_blockscaled(
         swiglu_limit=context.config.swiglu_limit,
         activation_slot_id_1=activation_buffer.activation_slot_id_1,
         num_moe_layers_in_slot=activation_buffer._num_moe_layers_in_selected_slot,
+        validate_expert_ids=options.validate_expert_ids,
+        zero_out_padded_callback_inputs=(options.zero_out_padded_callback_inputs),
     )

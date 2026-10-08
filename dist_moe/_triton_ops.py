@@ -34,7 +34,9 @@ from .kernels.triton.conditional_copy import (
     conditional_copy_activations,
     copy_activation_to_dispatch,
     copy_dispatch_to_activation,
+    copy_routing,
     copy_routing_and_dispatch,
+    zero_out_padded_rows_,
 )
 from .kernels.triton.swiglu import swiglu_bwd, swiglu_fwd
 
@@ -43,6 +45,7 @@ __all__ = [
     "conditional_copy_activations",
     "copy_activation_to_dispatch",
     "copy_dispatch_to_activation",
+    "copy_routing",
     "copy_routing_and_dispatch",
     "get_flat_tid",
     "reduce_from_topk",
@@ -53,6 +56,7 @@ __all__ = [
     "symmetric_memory_barrier",
     "sync_threads",
     "wait_signal",
+    "zero_out_padded_rows_",
 ]
 
 

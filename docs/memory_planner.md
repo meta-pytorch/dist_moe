@@ -46,6 +46,11 @@ maximum useful slot = all eligible state within total executable scratch capacit
 total device buffer = slot count * selected slot bytes + one device scratch frame
 ```
 
+These values describe allocation capacity, not mandatory per-call work. Each
+invocation may use a smaller physical `T`; routing metadata, planner offsets,
+saved-state accounting, and expert launch geometry use that actual shape while
+the context retains maximum-capacity storage.
+
 BF16 execution packs the actual received rows contiguously; its capacity factor
 only reserves the maximum scratch rows. MXFP8 and NVFP4 also allocate the
 actual received work dynamically, but each local expert is independently

@@ -70,6 +70,7 @@ def _validate_activation_buffer_args(
 def scale_and_sum(
     x: torch.Tensor,  # [T, K, D]
     scale: torch.Tensor,  # [T, K]
+    expert_ids: torch.Tensor | None = None,  # optional [T, K]
     return_copy: bool = True,
     output_dtype: torch.dtype | None = None,
     x_copy_buffer: torch.Tensor | None = None,
@@ -81,6 +82,8 @@ def scale_and_sum(
     Args:
         x: Input tensor [T, K, D] - can be a buffer tensor
         scale: Scaling factors [T, K]
+        expert_ids: Optional expert IDs. Negative routes are ignored without
+            reading their corresponding ``x`` storage.
         return_copy: If True, return a copy of x for backward. If False, return None.
         output_dtype: dtype for the output tensor y. If None, uses x.dtype.
         x_copy_buffer: Optional uint8 activation buffer receiving x when the
@@ -115,6 +118,14 @@ def scale_and_sum(
     # Check strides
     assert x.is_contiguous()
     assert scale.is_contiguous()
+    if expert_ids is not None:
+        if expert_ids.shape != (T, K) or expert_ids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("expert_ids must have shape [T, K] and int32/int64 dtype")
+        if not expert_ids.is_contiguous() or expert_ids.device != x.device:
+            raise ValueError("expert_ids must be contiguous on the input device")
     copy_x_to_buffer = _validate_activation_buffer_args(
         activation_buffer=x_copy_buffer,
         activation_offset=x_copy_offset,
@@ -150,6 +161,7 @@ def scale_and_sum(
     _triton_scale_and_sum[grid](
         x,
         scale,
+        expert_ids,
         y,
         x_copy,
         x_copy_buffer,
@@ -163,6 +175,7 @@ def scale_and_sum(
         NUM_CTA=num_ctas,
         COPY_X=return_copy,
         COPY_X_TO_BUFFER=copy_x_to_buffer,
+        HAS_EXPERT_IDS=expert_ids is not None,
         X_DTYPE=_to_tl_dtype(x_dtype),
         BLOCK_K=triton.next_power_of_2(K),
         TILE_D=T <= SCALE_AND_SUM_TILE_D_MAX_TOKENS,
@@ -177,6 +190,7 @@ def scale_and_sum(
 def _triton_scale_and_sum(  # noqa: C901
     x_ptr: torch.Tensor,  # [T, K, D]
     scale_ptr: torch.Tensor,  # [T, K] or None (for unscaled sum)
+    expert_ids_ptr,
     y_ptr: torch.Tensor,  # [T, D]
     x_copy_ptr: torch.Tensor,  # [T, K, D] - copy of x for backward
     x_copy_buffer_ptr,
@@ -190,6 +204,7 @@ def _triton_scale_and_sum(  # noqa: C901
     NUM_CTA: tl.constexpr,
     COPY_X: tl.constexpr,
     COPY_X_TO_BUFFER: tl.constexpr,
+    HAS_EXPERT_IDS: tl.constexpr,
     X_DTYPE: tl.constexpr,
     BLOCK_K: tl.constexpr,
     TILE_D: tl.constexpr,
@@ -237,6 +252,15 @@ def _triton_scale_and_sum(  # noqa: C901
             input_mask_t = input_offset_t < T
             input_mask_tk = input_mask_t & mask_k[None, :, None]
 
+            if HAS_EXPERT_IDS:
+                expert_ids = tl.load(
+                    expert_ids_ptr + input_offset_t * K + input_offset_k,
+                    mask=input_mask_tk,
+                    other=-1,
+                )
+                valid_routes = expert_ids >= 0
+                input_mask_tk &= valid_routes
+
             if scale_ptr is not None:
                 scale = tl.load(
                     scale_ptr + input_offset_t * K + input_offset_k,
@@ -248,7 +272,7 @@ def _triton_scale_and_sum(  # noqa: C901
 
             input_offset_d = (start_d + block_d)[None, None, :]
             output_mask = (input_offset_t < T) & (input_offset_d < D)
-            input_mask = output_mask & mask_k[None, :, None]
+            input_mask = output_mask & input_mask_tk
             x_value = tl.load(
                 x_ptr + input_offset_t * K * D + input_offset_k * D + input_offset_d,
                 mask=input_mask,
@@ -264,7 +288,7 @@ def _triton_scale_and_sum(  # noqa: C901
                         + input_offset_k * D
                         + input_offset_d,
                         x_value,
-                        mask=input_mask,
+                        mask=output_mask & mask_k[None, :, None],
                     )
 
             if COPY_X:
@@ -274,7 +298,7 @@ def _triton_scale_and_sum(  # noqa: C901
                     + input_offset_k * D
                     + input_offset_d,
                     x,
-                    mask=input_mask,
+                    mask=output_mask & mask_k[None, :, None],
                 )
 
             y = tl.sum(x * scale, axis=1, keep_dims=True)
@@ -298,6 +322,15 @@ def _triton_scale_and_sum(  # noqa: C901
             input_mask_t = input_offset_t < T
             input_mask_tk = input_mask_t & mask_k[None, :, None]
 
+            if HAS_EXPERT_IDS:
+                expert_ids = tl.load(
+                    expert_ids_ptr + input_offset_t * K + input_offset_k,
+                    mask=input_mask_tk,
+                    other=-1,
+                )
+                valid_routes = expert_ids >= 0
+                input_mask_tk &= valid_routes
+
             if scale_ptr is not None:
                 scale = tl.load(
                     scale_ptr + input_offset_t * K + input_offset_k,
@@ -310,7 +343,7 @@ def _triton_scale_and_sum(  # noqa: C901
             for start_d in tl.range(0, D, BLOCK_SIZE_D):
                 input_offset_d = (start_d + block_d)[None, None, :]
                 output_mask = (input_offset_t < T) & (input_offset_d < D)
-                input_mask = output_mask & mask_k[None, :, None]
+                input_mask = output_mask & input_mask_tk
                 x_value = tl.load(
                     x_ptr
                     + input_offset_t * K * D
@@ -329,7 +362,7 @@ def _triton_scale_and_sum(  # noqa: C901
                             + input_offset_k * D
                             + input_offset_d,
                             x_value,
-                            mask=input_mask,
+                            mask=output_mask & mask_k[None, :, None],
                         )
 
                 if COPY_X:
@@ -339,7 +372,7 @@ def _triton_scale_and_sum(  # noqa: C901
                         + input_offset_k * D
                         + input_offset_d,
                         x,
-                        mask=input_mask,
+                        mask=output_mask & mask_k[None, :, None],
                     )
 
                 y = tl.sum(x * scale, axis=1, keep_dims=True)
@@ -354,6 +387,7 @@ def broadcast_and_scale(
     dy: torch.Tensor,  # [T, D]
     scale: torch.Tensor,  # [T, K]
     x: torch.Tensor,  # [T, K, D]
+    expert_ids: torch.Tensor | None = None,  # optional [T, K]
     output_dtype: torch.dtype | None = None,
     dx: torch.Tensor | None = None,  # optional preallocated [T, K, D]
     x_buffer: torch.Tensor | None = None,
@@ -397,6 +431,14 @@ def broadcast_and_scale(
     assert dy.is_contiguous()
     assert scale.is_contiguous()
     assert x.is_contiguous()
+    if expert_ids is not None:
+        if expert_ids.shape != (T, K) or expert_ids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("expert_ids must have shape [T, K] and int32/int64 dtype")
+        if not expert_ids.is_contiguous() or expert_ids.device != x.device:
+            raise ValueError("expert_ids must be contiguous on the input device")
     read_x_from_buffer = _validate_activation_buffer_args(
         activation_buffer=x_buffer,
         activation_offset=x_buffer_offset,
@@ -444,6 +486,7 @@ def broadcast_and_scale(
     _triton_broadcast_and_scale[grid](
         dy,
         scale,
+        expert_ids,
         x,
         dx,
         dscale,
@@ -462,6 +505,7 @@ def broadcast_and_scale(
         NUM_CTA=num_ctas,
         X_DX_MAY_ALIAS=x_dx_exact_alias,
         READ_X_FROM_BUFFER=read_x_from_buffer,
+        HAS_EXPERT_IDS=expert_ids is not None,
         BLOCK_K=triton.next_power_of_2(K),
     )
     return dx, dscale
@@ -479,6 +523,7 @@ def _broadcast_and_scale_d_block(
     input_offset_k,
     start_d,
     block_d,
+    route_mask_tk,
     mask_k,
     T,
     K: tl.constexpr,
@@ -488,7 +533,8 @@ def _broadcast_and_scale_d_block(
     """One D-tile of broadcast_and_scale: dx store + dscale accumulation."""
     input_offset_d = (start_d + block_d)[None, None, :]
     output_mask = (input_offset_t < T) & (input_offset_d < D)
-    input_mask = output_mask & mask_k[None, :, None]
+    input_mask = output_mask & route_mask_tk
+    output_route_mask = output_mask & mask_k[None, :, None]
 
     dy = tl.load(
         dy_ptr + input_offset_t * D + input_offset_d,
@@ -515,7 +561,7 @@ def _broadcast_and_scale_d_block(
         tl.store(
             dx_ptr + input_offset_t * K * D + input_offset_k * D + input_offset_d,
             dx,
-            mask=input_mask,
+            mask=output_route_mask,
         )
     return dscale_acc
 
@@ -530,6 +576,7 @@ def _triton_broadcast_and_scale(
     # Regular mode: tensor pointers. Activation buffer mode: offset tensors
     dy_ptr,  # [T, D] tensor or [1] int64 byte offset
     scale_ptr,  # Can be None for unscaled broadcast
+    expert_ids_ptr,
     x_ptr,  # [T, K, D] tensor for dscale computation
     dx_ptr,  # [T, K, D] tensor or [1] int64 byte offset
     dscale_ptr,  # Can be None when scale_ptr is None
@@ -551,6 +598,7 @@ def _triton_broadcast_and_scale(
     NUM_CTA: tl.constexpr,
     X_DX_MAY_ALIAS: tl.constexpr,
     READ_X_FROM_BUFFER: tl.constexpr,
+    HAS_EXPERT_IDS: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ) -> None:
     """Unified kernel for broadcast/scale.
@@ -622,6 +670,14 @@ def _triton_broadcast_and_scale(
         input_mask_t = input_offset_t < T
         input_mask_tk = input_mask_t & mask_k[None, :, None]
 
+        if HAS_EXPERT_IDS:
+            expert_ids = tl.load(
+                expert_ids_ptr + input_offset_t * K + input_offset_k,
+                mask=input_mask_tk,
+                other=-1,
+            )
+            input_mask_tk &= expert_ids >= 0
+
         # Load scale if provided, otherwise use 1.0
         if scale_ptr is not None:
             scale = tl.load(
@@ -647,6 +703,7 @@ def _triton_broadcast_and_scale(
                 input_offset_k,
                 start_d,
                 block_d,
+                input_mask_tk,
                 mask_k,
                 T,
                 K,
@@ -659,12 +716,13 @@ def _triton_broadcast_and_scale(
             tl.store(
                 dscale_ptr + input_offset_t * K + input_offset_k,
                 dscale_acc,
-                mask=input_mask_tk,
+                mask=input_mask_t & mask_k[None, :, None],
             )
 
 
 def reduce_from_topk(
     x: torch.Tensor,  # [T, K, D]
+    expert_ids: torch.Tensor | None = None,  # optional [T, K]
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Reduce from topk dimension by summing without scaling.
@@ -674,6 +732,7 @@ def reduce_from_topk(
 
     Args:
         x: Input tensor [T, K, D]
+        expert_ids: Optional expert IDs. Negative routes are excluded.
         out_dtype: Output dtype; defaults to ``x``'s. The kernel sums in fp32,
             so ``torch.float32`` keeps that sum instead of narrowing it.
 
@@ -691,6 +750,14 @@ def reduce_from_topk(
 
     # Check strides
     assert x.is_contiguous()
+    if expert_ids is not None:
+        if expert_ids.shape != (T, K) or expert_ids.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("expert_ids must have shape [T, K] and int32/int64 dtype")
+        if not expert_ids.is_contiguous() or expert_ids.device != x.device:
+            raise ValueError("expert_ids must be contiguous on the input device")
 
     # Allocate output
     y = torch.empty((T, D), device=x.device, dtype=out_dtype or x_dtype)
@@ -716,6 +783,7 @@ def reduce_from_topk(
     _triton_scale_and_sum[grid](
         x,
         None,  # scale_ptr = None (no scaling, just sum)
+        expert_ids,
         y,
         None,  # x_copy_ptr = None (skip copy for forward-only reduction)
         None,  # x_copy_buffer_ptr
@@ -729,6 +797,7 @@ def reduce_from_topk(
         NUM_CTA=num_ctas,
         COPY_X=False,
         COPY_X_TO_BUFFER=False,
+        HAS_EXPERT_IDS=expert_ids is not None,
         X_DTYPE=_to_tl_dtype(x_dtype),
         BLOCK_K=triton.next_power_of_2(K),
         TILE_D=T <= SCALE_AND_SUM_TILE_D_MAX_TOKENS,

@@ -22,7 +22,10 @@ NVFP4 uses only forward propagation (**FPROP**). It has no input-gradient
 <a id="public-contract"></a>
 ## Public contract
 
-NVFP4 is an inference-only mode. The following fragment assumes the imports,
+NVFP4 is an inference-only mode. Expert ID `-1` marks an inactive route: it is
+absent from communication and expert kernels, and final reduction masks the
+unwritten combine slot so an all-padding token produces an exact zero output
+row. The following fragment assumes the imports,
 tensor names, dimensions, device, and expert-parallel group from the README
 quickstart:
 

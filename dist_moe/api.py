@@ -1878,6 +1878,7 @@ class _Bf16Autograd(torch.autograd.Function):
         )
         from dist_moe._triton_ops import (
             copy_dispatch_to_activation,
+            copy_routing,
             copy_routing_and_dispatch,
             swiglu_fwd,
         )
@@ -1892,8 +1893,10 @@ class _Bf16Autograd(torch.autograd.Function):
         postprocess = _resolve_experts_output_postprocess_fn(
             options.experts_output_postprocess,
             x_TD=x_TD,
+            topk_expert_ids_TK=topk_expert_ids_TK,
             topk_scores_TK=topk_scores_TK,
             inference_mode=config.inference,
+            zero_out_padded_callback_inputs=(options.zero_out_padded_callback_inputs),
         )
         num_local_input_tokens = x_TD.shape[0]
         local_rank = dist.get_rank(context.group)
@@ -1914,8 +1917,13 @@ class _Bf16Autograd(torch.autograd.Function):
         # pointers. Every rank observes both payloads after the same barrier.
         with record_function("dist_moe_preprocess"):
             if config.inference:
-                routing_local_TK.copy_(topk_expert_ids_TK)
-                routing_token_count_1.fill_(num_local_input_tokens)
+                copy_routing(
+                    expert_ids=topk_expert_ids_TK,
+                    routing=routing_local_TK,
+                    routing_token_count_1=routing_token_count_1,
+                    num_experts=config.num_experts,
+                    validate_expert_ids=options.validate_expert_ids,
+                )
                 dispatch_local_TD.copy_(x_TD)
             else:
                 copy_routing_and_dispatch(
@@ -1924,6 +1932,8 @@ class _Bf16Autograd(torch.autograd.Function):
                     expert_ids=topk_expert_ids_TK,
                     routing=routing_local_TK,
                     routing_token_count_1=routing_token_count_1,
+                    num_experts=config.num_experts,
+                    validate_expert_ids=options.validate_expert_ids,
                 )
             _ep_barrier(buffers.dispatch)
 
@@ -2077,6 +2087,7 @@ class _Bf16Autograd(torch.autograd.Function):
         ctx.save_for_backward(
             w13_source,
             w2_source,
+            topk_expert_ids_TK,
             topk_scores_TK,
             routing.num_tokens_per_local_experts,
             routing.bwd_gather_ptrs,
@@ -2139,6 +2150,7 @@ class _Bf16Autograd(torch.autograd.Function):
         (
             w13_source,
             w2_source,
+            topk_expert_ids_TK,
             topk_scores_TK,
             num_recv_rows_per_local_expert_E,
             dispatch_bwd_gather_ptrs_M,
@@ -2445,7 +2457,10 @@ class _Bf16Autograd(torch.autograd.Function):
         # `[T, D]`, and restore logical weight shapes unless an external WGRAD
         # owner consumed those gradients directly.
         _ep_barrier(buffers.dispatch)
-        grad_x_TD = reduce_from_topk(grad_x_TKD)
+        grad_x_TD = reduce_from_topk(
+            grad_x_TKD,
+            expert_ids=topk_expert_ids_TK,
+        )
         external_wgrad_destination = options.wgrad_destination_fn is not None
         return (
             grad_x_TD,
@@ -2484,7 +2499,8 @@ _LIBRARY.define(
     "Tensor(a!) activation_storage, Tensor activation_slot_id_1, int num_moe_layers_in_slot, "
     "Tensor(b!) routing_storage, "
     "Tensor(c!) dispatch_storage, Tensor(d!) combine_storage, "
-    "Tensor(e!)? swiglu_clip_stats_out_3, float swiglu_clip_limit, str context_id) "
+    "Tensor(e!)? swiglu_clip_stats_out_3, float swiglu_clip_limit, "
+    "bool validate_expert_ids, str context_id) "
     "-> Tensor"
 )
 
@@ -2513,6 +2529,7 @@ def _dist_moe_custom_op_cuda(
     combine_storage: torch.Tensor,
     swiglu_clip_stats_out_3: torch.Tensor | None,
     swiglu_clip_limit: float,
+    validate_expert_ids: bool,
     context_id: str,
 ) -> torch.Tensor:
     """Run the CUDA implementation through its autograd function.
@@ -2540,6 +2557,7 @@ def _dist_moe_custom_op_cuda(
         combine_storage: Graph-visible combine payload.
         swiglu_clip_stats_out_3: Optional graph-visible FP32 SwiGLU counters.
         swiglu_clip_limit: Threshold for the optional clip counters.
+        validate_expert_ids: Whether publication validates expert-ID bounds.
         context_id: Process-local execution context identifier.
 
     Returns:
@@ -2575,6 +2593,7 @@ def _dist_moe_custom_op_cuda(
             experts_output_postprocess=postprocess,
             swiglu_clip_stats_out_3=swiglu_clip_stats_out_3,
             swiglu_clip_limit=swiglu_clip_limit,
+            validate_expert_ids=validate_expert_ids,
         ),
         False,
     )
@@ -2604,6 +2623,7 @@ def _dist_moe_custom_op_meta(
     combine_storage: torch.Tensor,
     swiglu_clip_stats_out_3: torch.Tensor | None,
     swiglu_clip_limit: float,
+    validate_expert_ids: bool,
     context_id: str,
 ) -> torch.Tensor:
     """Describe the inference custom-op output without communication.
@@ -2630,6 +2650,7 @@ def _dist_moe_custom_op_meta(
         combine_storage: Combine allocation, unused by the fake kernel.
         swiglu_clip_stats_out_3: Clip counters, unused by the fake kernel.
         swiglu_clip_limit: Clip threshold, unused by the fake kernel.
+        validate_expert_ids: Debug validation policy, unused by the fake kernel.
         context_id: Context identifier, unused by the fake kernel.
 
     Returns:
@@ -2657,6 +2678,7 @@ def _dist_moe_custom_op_meta(
         combine_storage,
         swiglu_clip_stats_out_3,
         swiglu_clip_limit,
+        validate_expert_ids,
         context_id,
     )
     return torch.empty_like(x_TD)
@@ -2679,6 +2701,7 @@ def _run_registered_bf16_forward(
     rmsnorm_recompute_rstd: bool,
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
+    validate_expert_ids: bool,
     context_id: str,
     options: ExecutionOptions | None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -2701,6 +2724,7 @@ def _run_registered_bf16_forward(
         rmsnorm_recompute_rstd: Whether backward recomputes reciprocal RMS values.
         activation_slot_id_1: Selected physical activation slot.
         num_moe_layers_in_slot: Static MoE-layer count for the selected slot.
+        validate_expert_ids: Whether publication validates expert-ID bounds.
         context_id: Process-local execution context identifier.
         options: Optional eager controls used inside the opaque operation.
 
@@ -2741,11 +2765,12 @@ def _run_registered_bf16_forward(
         dataclasses.replace(
             _resolve_execution_options(options),
             experts_output_postprocess=postprocess,
+            validate_expert_ids=validate_expert_ids,
         ),
         True,
     )
     saved_tensors = kernel_ctx.saved_tensors
-    if len(saved_tensors) != 17:
+    if len(saved_tensors) != 18:
         raise RuntimeError(
             f"BF16 training forward produced {len(saved_tensors)} saved tensors"
         )
@@ -2756,7 +2781,7 @@ def _run_registered_bf16_forward(
     if postprocess_context is None:
         postprocess_context = x_TD.new_empty(0)
     return output_TD, [
-        *saved_tensors[3:10],
+        *saved_tensors[4:11],
         forward_state_6,
         postprocess_context,
     ]
@@ -2784,6 +2809,7 @@ def _bf16_forward_op(
     rmsnorm_recompute_rstd: bool,
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
+    validate_expert_ids: bool,
     context_id: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Run BF16 training forward and expose fixed backward state.
@@ -2805,6 +2831,7 @@ def _bf16_forward_op(
         rmsnorm_recompute_rstd: Whether backward recomputes reciprocal RMS values.
         activation_slot_id_1: Selected physical activation slot.
         num_moe_layers_in_slot: Static MoE-layer count for the selected slot.
+        validate_expert_ids: Whether publication validates expert-ID bounds.
         context_id: Process-local execution context identifier.
 
     Returns:
@@ -2829,6 +2856,7 @@ def _bf16_forward_op(
         rmsnorm_recompute_rstd,
         activation_slot_id_1,
         num_moe_layers_in_slot,
+        validate_expert_ids,
         context_id,
         None,
     )
@@ -2851,6 +2879,7 @@ def _fake_registered_bf16_forward(
     rmsnorm_recompute_rstd: bool,
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
+    validate_expert_ids: bool,
     context_id: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Build BF16 output and saved-state metadata without reading data.
@@ -2872,6 +2901,7 @@ def _fake_registered_bf16_forward(
         rmsnorm_recompute_rstd: Whether backward recomputes reciprocal RMS values.
         activation_slot_id_1: Fake selected physical activation slot.
         num_moe_layers_in_slot: Static slot depth, unused by the fake kernel.
+        validate_expert_ids: Debug validation policy, unused by the fake kernel.
         context_id: Process-local context identifier supplying static config.
 
     Returns:
@@ -2889,6 +2919,7 @@ def _fake_registered_bf16_forward(
         rmsnorm_use_kahan,
         activation_slot_id_1,
         num_moe_layers_in_slot,
+        validate_expert_ids,
     )
     context = _get_context(context_id)
     num_local_experts = w13_EFD.shape[0]
@@ -2935,6 +2966,7 @@ def _bf16_forward_fake(
     rmsnorm_recompute_rstd: bool,
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
+    validate_expert_ids: bool,
     context_id: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Return BF16 forward metadata for FakeTensor propagation."""
@@ -2955,6 +2987,7 @@ def _bf16_forward_fake(
         rmsnorm_recompute_rstd,
         activation_slot_id_1,
         num_moe_layers_in_slot,
+        validate_expert_ids,
         context_id,
     )
 
@@ -2987,6 +3020,7 @@ def _bf16_forward_with_clip_stats_op(
     rmsnorm_recompute_rstd: bool,
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
+    validate_expert_ids: bool,
     swiglu_clip_limit: float,
     context_id: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
@@ -3009,6 +3043,7 @@ def _bf16_forward_with_clip_stats_op(
         rmsnorm_recompute_rstd: Whether backward recomputes reciprocal RMS values.
         activation_slot_id_1: Selected physical activation slot.
         num_moe_layers_in_slot: Static MoE-layer count for the selected slot.
+        validate_expert_ids: Whether publication validates expert-ID bounds.
         swiglu_clip_limit: Threshold for the returned clip counters.
         context_id: Process-local execution context identifier.
 
@@ -3033,6 +3068,7 @@ def _bf16_forward_with_clip_stats_op(
         rmsnorm_recompute_rstd,
         activation_slot_id_1,
         num_moe_layers_in_slot,
+        validate_expert_ids,
         context_id,
         ExecutionOptions(
             swiglu_clip_stats_out_3=clip_stats_out_3,
@@ -3060,6 +3096,7 @@ def _bf16_forward_with_clip_stats_fake(
     rmsnorm_recompute_rstd: bool,
     activation_slot_id_1: torch.Tensor,
     num_moe_layers_in_slot: int,
+    validate_expert_ids: bool,
     swiglu_clip_limit: float,
     context_id: str,
 ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
@@ -3081,6 +3118,7 @@ def _bf16_forward_with_clip_stats_fake(
         rmsnorm_recompute_rstd,
         activation_slot_id_1,
         num_moe_layers_in_slot,
+        validate_expert_ids,
         context_id,
     )
     return output_TD, state_tensors, x_TD.new_empty((3,), dtype=torch.float32)
@@ -3093,6 +3131,7 @@ def _run_bf16_registered_backward(
     grad_output_TD: torch.Tensor,
     w13_EFD: torch.Tensor,
     w2_EDF: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
     rmsnorm_enabled: bool,
@@ -3113,6 +3152,7 @@ def _run_bf16_registered_backward(
         grad_output_TD: Gradient of the local MoE output.
         w13_EFD: Local gate/up weights.
         w2_EDF: Local down weights.
+        topk_expert_ids_TK: Expert IDs from forward.
         topk_scores_TK: Router scores from forward.
         state_tensors: Routing metadata followed by packed planner state whose
             final value is the original forward's selected-slot snapshot.
@@ -3159,6 +3199,7 @@ def _run_bf16_registered_backward(
     postprocess = _resolve_experts_output_postprocess_fn(
         postprocess_config,
         x_TD=grad_output_TD,
+        topk_expert_ids_TK=topk_expert_ids_TK,
         topk_scores_TK=topk_scores_TK,
     )
     (
@@ -3189,6 +3230,7 @@ def _run_bf16_registered_backward(
     kernel_ctx.saved_tensors = (
         w13_EFD,
         w2_EDF,
+        topk_expert_ids_TK,
         topk_scores_TK,
         num_recv_rows_per_local_expert_E,
         dispatch_bwd_gather_ptrs_M,
@@ -3223,6 +3265,7 @@ def _bf16_backward_op(
     grad_output_TD: torch.Tensor,
     w13_EFD: torch.Tensor,
     w2_EDF: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
     rmsnorm_enabled: bool,
@@ -3240,6 +3283,7 @@ def _bf16_backward_op(
         grad_output_TD,
         w13_EFD,
         w2_EDF,
+        topk_expert_ids_TK,
         topk_scores_TK,
         state_tensors,
         rmsnorm_enabled,
@@ -3266,6 +3310,7 @@ def _bf16_backward_accumulate_op(
     w2_EDF: torch.Tensor,
     accumulator_grad_w13_EFD: torch.Tensor,
     accumulator_grad_w2_EDF: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
     rmsnorm_enabled: bool,
@@ -3290,6 +3335,7 @@ def _bf16_backward_accumulate_op(
         grad_output_TD,
         w13_EFD,
         w2_EDF,
+        topk_expert_ids_TK,
         topk_scores_TK,
         state_tensors,
         rmsnorm_enabled,
@@ -3311,6 +3357,7 @@ def _bf16_backward_fake(
     grad_output_TD: torch.Tensor,
     w13_EFD: torch.Tensor,
     w2_EDF: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
     rmsnorm_enabled: bool,
@@ -3329,6 +3376,7 @@ def _bf16_backward_fake(
         grad_output_TD: Fake output gradient.
         w13_EFD: Fake gate/up weights.
         w2_EDF: Fake down weights.
+        topk_expert_ids_TK: Fake expert IDs.
         topk_scores_TK: Fake router scores.
         state_tensors: Fake routing and activation-plan state.
         rmsnorm_enabled: Whether fused post-expert RMSNorm is selected.
@@ -3345,6 +3393,7 @@ def _bf16_backward_fake(
         Fake gradients for input, routing scores, w13, and w2.
     """
     del (
+        topk_expert_ids_TK,
         state_tensors,
         rmsnorm_enabled,
         rmsnorm_eps,
@@ -3370,6 +3419,7 @@ def _bf16_backward_accumulate_fake(
     w2_EDF: torch.Tensor,
     accumulator_grad_w13_EFD: torch.Tensor,
     accumulator_grad_w2_EDF: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
     rmsnorm_enabled: bool,
@@ -3384,6 +3434,7 @@ def _bf16_backward_accumulate_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return non-WGRAD metadata for a fake accumulating BF16 backward."""
     del (
+        topk_expert_ids_TK,
         state_tensors,
         rmsnorm_enabled,
         rmsnorm_eps,
@@ -3429,7 +3480,7 @@ def _bf16_setup_context(
     """
     (
         _x_TD,
-        _topk_expert_ids_TK,
+        topk_expert_ids_TK,
         topk_scores_TK,
         w13_EFD,
         w2_EDF,
@@ -3444,6 +3495,7 @@ def _bf16_setup_context(
         rmsnorm_recompute_rstd,
         _activation_slot_id_1,
         _num_moe_layers_in_slot,
+        _validate_expert_ids,
         context_id,
     ) = inputs
     _output_TD, state_tensors = output
@@ -3461,6 +3513,7 @@ def _bf16_setup_context(
     ctx.save_for_backward(
         w13_EFD,
         w2_EDF,
+        topk_expert_ids_TK,
         topk_scores_TK,
         *state_tensors,
     )
@@ -3482,7 +3535,9 @@ def _bf16_autograd_backward(
         Gradients matching the BF16 forward operator inputs.
     """
     del unused_state_gradients
-    w13_EFD, w2_EDF, topk_scores_TK, *state_tensors = ctx.saved_tensors
+    w13_EFD, w2_EDF, topk_expert_ids_TK, topk_scores_TK, *state_tensors = (
+        ctx.saved_tensors
+    )
     inplace_wgrad_accum = getattr(ctx, "inplace_wgrad_accum", False)
     w13_compute_EFD = (
         w13_EFD.view(ctx.w13_compute_shape) if inplace_wgrad_accum else w13_EFD
@@ -3503,6 +3558,7 @@ def _bf16_autograd_backward(
     else:
         wgrad_output_dtype = context.config.wgrad_dtype or w13_compute_EFD.dtype
     registered_args = (
+        topk_expert_ids_TK,
         topk_scores_TK,
         state_tensors,
         ctx.rmsnorm_enabled,
@@ -3558,6 +3614,7 @@ def _bf16_autograd_backward(
         None,  # rmsnorm_recompute_rstd
         None,  # activation_slot_id_1
         None,  # num_moe_layers_in_slot
+        None,  # validate_expert_ids
         None,  # context_id
     )
 
@@ -3612,6 +3669,7 @@ class _RegisteredBf16Autograd(torch.autograd.Function):
             rmsnorm_recompute_rstd,
             activation_slot_id_1,
             num_moe_layers_in_slot,
+            options.validate_expert_ids,
             context_id,
         )
         if swiglu_clip_stats_out_3 is None:
@@ -3671,9 +3729,9 @@ def _bf16_clip_setup_context(
     output: tuple[torch.Tensor, list[torch.Tensor], torch.Tensor],
 ) -> None:
     """Save functional BF16 state and mark returned clip counters as metadata."""
-    # The clip-enabled wrapper inserts swiglu_clip_limit at input index 16.
+    # The clip-enabled wrapper inserts swiglu_clip_limit at input index 17.
     # Remove exactly that non-differentiable scalar before sharing base setup.
-    base_inputs = (*inputs[:16], *inputs[17:])
+    base_inputs = (*inputs[:17], *inputs[18:])
     _bf16_setup_context(ctx, base_inputs, output[:2])
     ctx.mark_non_differentiable(output[2])
 
@@ -3702,7 +3760,7 @@ def _bf16_clip_autograd_backward(
         unused_state_gradients,
     )
     # Restore the omitted scalar's gradient slot at the same input index.
-    return (*gradients[:16], None, *gradients[16:])
+    return (*gradients[:17], None, *gradients[17:])
 
 
 _bf16_forward_with_clip_stats_op.register_autograd(
@@ -3728,9 +3786,10 @@ def routed_experts(  # noqa: C901
             every EP rank uses the same
             ``1 <= T <= context.max_num_local_input_tokens`` for this call.
         topk_expert_ids_TK: Contiguous CUDA int32 or int64 global expert IDs
-            with shape ``[T, K]`` and values in ``[0, num_experts)``.
+            with shape ``[T, K]`` and values in ``[-1, num_experts)``. ``-1``
+            disables that route.
         topk_scores_TK: Contiguous CUDA BF16 or FP32 expert weights with shape
-            ``[T, K]``.
+            ``[T, K]``. Callers must use score zero for ``-1`` routes.
         w13_weight: Local BF16 gate/up weight with shape
             ``[E_local, 2, F, D]``, ``[E_local, 2F, D]``, or
             ``[E_local * 2F, D]``, or a prepared MXFP8/NVFP4 operand whose
@@ -3931,6 +3990,7 @@ def routed_experts(  # noqa: C901
             *rmsnorm_args,
             activation_buffer.activation_slot_id_1,
             activation_buffer._num_moe_layers_in_selected_slot,
+            options.validate_expert_ids,
         )
         if clip_stats_out_3 is None:
             output_TD, _state_tensors = _bf16_forward_op(
@@ -3962,6 +4022,7 @@ def routed_experts(  # noqa: C901
         context.buffers.combine.local(),
         clip_stats_out_3,
         options.swiglu_clip_limit,
+        options.validate_expert_ids,
         context.context_id,
     )
 

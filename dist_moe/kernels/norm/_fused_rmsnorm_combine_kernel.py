@@ -32,7 +32,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import const_expr, Float32
+from cutlass import const_expr, Float32, Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op, T
 
@@ -151,6 +151,7 @@ class FusedRMSNormCombineFwd(ReductionBase):
         tile_d: bool = False,
         copy_input: bool = False,
         has_weight: bool = False,
+        has_expert_ids: bool = False,
     ):
         super().__init__(dtype, N, stage=2)
         # The input-scale gamma participates in the sum-of-squares, so it must
@@ -170,6 +171,7 @@ class FusedRMSNormCombineFwd(ReductionBase):
         self.tile_d = tile_d
         self.copy_input = copy_input
         self.has_weight = has_weight
+        self.has_expert_ids = has_expert_ids
         self.cluster_n = 1
         capability = (
             torch.cuda.get_device_capability(torch.cuda.current_device())
@@ -260,8 +262,11 @@ class FusedRMSNormCombineFwd(ReductionBase):
         mRstd: cute.Tensor,
         mXCopy: cute.Tensor,
         mG: cute.Tensor | None = None,
+        mExpertIds: cute.Tensor | None = None,
     ) -> bool:
         if (mG is None) == self.has_weight:
+            return False
+        if (mExpertIds is None) == self.has_expert_ids:
             return False
         if mG is not None and not (
             mG.element_type == self.dtype
@@ -299,6 +304,7 @@ class FusedRMSNormCombineFwd(ReductionBase):
         mRstd: cute.Tensor,
         mXCopy: cute.Tensor,
         mG: cute.Tensor | None,
+        mExpertIds: cute.Tensor | None,
         eps: Float32,
         gain_center: Float32,
         stream: cuda.CUstream,
@@ -318,6 +324,7 @@ class FusedRMSNormCombineFwd(ReductionBase):
             mRstd,
             mXCopy,
             mG,
+            mExpertIds,
             eps,
             gain_center,
             tiler_mn,
@@ -341,6 +348,7 @@ class FusedRMSNormCombineFwd(ReductionBase):
         mRstd: cute.Tensor,
         mXCopy: cute.Tensor,
         mG: cute.Tensor | None,
+        mExpertIds: cute.Tensor | None,
         eps: Float32,
         gain_center: Float32,
         tiler_mn: cute.Shape,
@@ -396,6 +404,11 @@ class FusedRMSNormCombineFwd(ReductionBase):
             mY.element_type.width == 16 and self.norm_dtype.width == 32 and TOPK > 1
         )
         sW = smem.allocate_tensor(Float32, cute.make_layout(TOPK), byte_alignment=4)
+        sValid = (
+            smem.allocate_tensor(Int32, cute.make_layout(TOPK), byte_alignment=4)
+            if const_expr(self.has_expert_ids)
+            else None
+        )
 
         DIM = mX.shape[1]
         is_even_N = const_expr(DIM == tiler_mn[1] * self.cluster_n)
@@ -410,6 +423,11 @@ class FusedRMSNormCombineFwd(ReductionBase):
         gX = cute.local_tile(mX, topk_tiler_mn, (bidx, cluster_y))
         gXCopy = cute.local_tile(mXCopy, topk_tiler_mn, (bidx, cluster_y))
         gW = cute.local_tile(mW, (TOPK,), (bidx,))
+        gExpertIds = (
+            cute.local_tile(mExpertIds, (TOPK,), (bidx,))
+            if const_expr(self.has_expert_ids)
+            else None
+        )
         gRstd = cute.local_tile(mRstd, (TOPK,), (bidx,))
         idX = cute.make_identity_tensor(mX.shape)
         cX = cute.local_tile(idX, topk_tiler_mn, (bidx, cluster_y))
@@ -443,6 +461,9 @@ class FusedRMSNormCombineFwd(ReductionBase):
 
         if tidx < TOPK:
             sW[tidx] = gW[tidx]
+            if const_expr(self.has_expert_ids):
+                assert sValid is not None and gExpertIds is not None
+                sValid[tidx] = Int32(gExpertIds[tidx] >= 0)
         cute.arch.barrier()
 
         if const_expr(use_pipelined_load):
@@ -532,6 +553,11 @@ class FusedRMSNormCombineFwd(ReductionBase):
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.autovec_copy(tXsX, tXrX)
+
+            if const_expr(self.has_expert_ids):
+                assert sValid is not None
+                if sValid[k] == 0:
+                    tXrX.fill(0.0)
 
             if const_expr(self.copy_input):
                 gXCopy_k = cute.local_tile(gXCopy, tiler_mn, (k, 0))
@@ -678,10 +704,12 @@ class FusedRMSNormCombineBwdExact(ReductionBase):
         grad_y_dtype: Type[cutlass.Numeric],
         N: int,
         TOPK: int,
+        has_expert_ids: bool = False,
     ):
         super().__init__(dtype, N, stage=1)
         self.grad_y_dtype = grad_y_dtype
         self.TOPK = TOPK
+        self.has_expert_ids = has_expert_ids
         self.cluster_n = 1
         self._is_blackwell = (
             torch.cuda.is_available()
@@ -710,7 +738,10 @@ class FusedRMSNormCombineBwdExact(ReductionBase):
         mRstd: cute.Tensor,
         mGradX: cute.Tensor,
         mGradW: cute.Tensor,
+        mExpertIds: cute.Tensor | None,
     ) -> bool:
+        if (mExpertIds is None) == self.has_expert_ids:
+            return False
         return (
             mX.element_type == self.dtype
             and mGradY.element_type == self.grad_y_dtype
@@ -735,6 +766,7 @@ class FusedRMSNormCombineBwdExact(ReductionBase):
         mRstd: cute.Tensor,
         mGradX: cute.Tensor,
         mGradW: cute.Tensor,
+        mExpertIds: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
@@ -749,6 +781,7 @@ class FusedRMSNormCombineBwdExact(ReductionBase):
             mRstd,
             mGradX,
             mGradW,
+            mExpertIds,
             tiler_mn,
             tiled_copy,
             threads_per_row,
@@ -768,6 +801,7 @@ class FusedRMSNormCombineBwdExact(ReductionBase):
         mRstd: cute.Tensor,
         mGradX: cute.Tensor,
         mGradW: cute.Tensor,
+        mExpertIds: cute.Tensor | None,
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
@@ -822,6 +856,11 @@ class FusedRMSNormCombineBwdExact(ReductionBase):
         gW = cute.local_tile(mW, (TOPK,), (bidx,))
         gGradW = cute.local_tile(mGradW, (TOPK,), (bidx,))
         gGradX = cute.local_tile(mGradX, topk_tiler_mn, (bidx, 0))
+        gExpertIds = (
+            cute.local_tile(mExpertIds, (TOPK,), (bidx,))
+            if const_expr(self.has_expert_ids)
+            else None
+        )
         gX_k = cute.local_tile(gX, tiler_mn, (kidx, 0))
         gGradX_k = cute.local_tile(gGradX, tiler_mn, (kidx, 0))
 
@@ -849,8 +888,14 @@ class FusedRMSNormCombineBwdExact(ReductionBase):
         copy(tXgGradY, tXrGradY)
         copy(tXgX_k, tXrX)
         rstd_k = gRstd[kidx]
+        valid = Int32(1)
+        if const_expr(self.has_expert_ids):
+            valid = Int32(gExpertIds[kidx] >= 0)
         w_k = gW[kidx]
         grad_y = tXrGradY.load().to(Float32)
+        if valid == 0:
+            w_k = Float32(0.0)
+            tXrX.fill(0.0)
         x = tXrX.load().to(Float32)
         x_norm = x * rstd_k
 
@@ -968,10 +1013,12 @@ class FusedRMSNormCombineBwd(ReductionBase):
         grad_y_dtype: Type[cutlass.Numeric],
         N: int,
         TOPK: int,
+        has_expert_ids: bool = False,
     ):
         super().__init__(dtype, N, stage=1)
         self.grad_y_dtype = grad_y_dtype
         self.TOPK = TOPK
+        self.has_expert_ids = has_expert_ids
         self.cluster_n = 1
         self._num_threads_val = 256 if is_blackwell_gpu() else 128
 
@@ -993,7 +1040,10 @@ class FusedRMSNormCombineBwd(ReductionBase):
         mRstd: cute.Tensor,
         mGradX: cute.Tensor,
         mGradW: cute.Tensor,
+        mExpertIds: cute.Tensor | None,
     ) -> bool:
+        if (mExpertIds is None) == self.has_expert_ids:
+            return False
         return (
             mX.element_type == self.dtype
             and mGradY.element_type == self.grad_y_dtype
@@ -1015,6 +1065,7 @@ class FusedRMSNormCombineBwd(ReductionBase):
         mRstd: cute.Tensor,
         mGradX: cute.Tensor,
         mGradW: cute.Tensor,
+        mExpertIds: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
@@ -1034,6 +1085,7 @@ class FusedRMSNormCombineBwd(ReductionBase):
             mRstd,
             mGradX,
             mGradW,
+            mExpertIds,
             tiler_mn,
             tiled_copy,
             threads_per_row,
@@ -1053,6 +1105,7 @@ class FusedRMSNormCombineBwd(ReductionBase):
         mRstd: cute.Tensor,
         mGradX: cute.Tensor,
         mGradW: cute.Tensor,
+        mExpertIds: cute.Tensor | None,
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
@@ -1094,6 +1147,11 @@ class FusedRMSNormCombineBwd(ReductionBase):
         gW = cute.local_tile(mW, (TOPK,), (bidx,))
         gGradW = cute.local_tile(mGradW, (TOPK,), (bidx,))
         gGradX = cute.local_tile(mGradX, topk_tiler_mn, (bidx, 0))
+        gExpertIds = (
+            cute.local_tile(mExpertIds, (TOPK,), (bidx,))
+            if const_expr(self.has_expert_ids)
+            else None
+        )
 
         # Predication (shared for all rows — same DIM)
         idX = cute.make_identity_tensor(mX.shape)
@@ -1127,8 +1185,14 @@ class FusedRMSNormCombineBwd(ReductionBase):
             if not is_even_N:
                 tXrX.fill(0.0)
             copy(tXgX_k, tXrX)
+            valid = Int32(1)
+            if const_expr(self.has_expert_ids):
+                valid = Int32(gExpertIds[kidx] >= 0)
             rstd_k = gRstd[kidx]
             w_k = gW[kidx]
+            if valid == 0:
+                w_k = Float32(0.0)
+                tXrX.fill(0.0)
             x_norm = tXrX.load().to(Float32) * rstd_k
             cute.autovec_copy(tXsGradY, tXrGradY)
             grad_y = tXrGradY.load().to(Float32)

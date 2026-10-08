@@ -209,6 +209,9 @@ def _reference_moe(
         token_outputs = []
         for slot in range(topk_ids.shape[1]):
             expert = int(topk_ids[token_index, slot])
+            if expert < 0:
+                token_outputs.append(torch.zeros_like(x[token_index]))
+                continue
             h13 = F.linear(x[token_index], w13[expert])
             gate, up = h13.split(intermediate_dim)
             gate_f32, up_f32 = gate.float(), up.float()
@@ -260,14 +263,18 @@ def _reference_swiglu_clip_stats(
     intermediate_dim = w13_EFD.shape[1] // 2
     gate_count = 0
     up_count = 0
+    valid_routes = 0
     for token_index in range(x_TD.shape[0]):
         for route_index in range(topk_expert_ids_TK.shape[1]):
             expert = int(topk_expert_ids_TK[token_index, route_index])
+            if expert < 0:
+                continue
+            valid_routes += 1
             h13_2F = F.linear(x_TD[token_index], w13_EFD[expert])
             gate_F, up_F = h13_2F.split(intermediate_dim)
             gate_count += int((gate_F.float() > clip_limit).sum())
             up_count += int((up_F.float().abs() > clip_limit).sum())
-    total = x_TD.shape[0] * topk_expert_ids_TK.shape[1] * intermediate_dim
+    total = valid_routes * intermediate_dim
     return torch.tensor(
         (gate_count, up_count, total),
         dtype=torch.float32,
@@ -386,6 +393,9 @@ class DistMoeConfigTest(unittest.TestCase):
             dist_moe.ExecutionOptions(
                 swiglu_clip_stats_out_3=torch.empty(3, dtype=torch.float32)
             )
+        for name in ("validate_expert_ids", "zero_out_padded_callback_inputs"):
+            with self.subTest(name=name), self.assertRaisesRegex(TypeError, "bool"):
+                dist_moe.ExecutionOptions(**{name: 1})
 
     def test_registered_bf16_schema_exposes_clip_statistics_mutation(self) -> None:
         """Inference mutates counters while training returns functional state."""
@@ -1743,6 +1753,8 @@ class DistMoeKernelTest(unittest.TestCase):
             expert_ids=expert_ids,
             routing=routing,
             routing_token_count_1=routing_token_count_1,
+            num_experts=16,
+            validate_expert_ids=True,
         )
 
         offset_bytes = 256
@@ -1802,6 +1814,8 @@ class DistMoeKernelTest(unittest.TestCase):
                 expert_ids=expert_ids,
                 routing=routing,
                 routing_token_count_1=routing_token_count_1,
+                num_experts=16,
+                validate_expert_ids=True,
             )
 
         publish()  # Compile before capture and exercise the eager boundary.
@@ -2019,8 +2033,109 @@ class DistMoeKernelTest(unittest.TestCase):
                 prepared_w13,
                 prepared_w2,
                 context,
+                options=dist_moe.ExecutionOptions(validate_expert_ids=True),
             )
         self.assertEqual(actual_TD.shape, short_x_TD.shape)
+
+    def test_padding_routes_match_reference_forward_and_backward(self) -> None:
+        """BF16/MXFP8 ignore mixed and fully padded routes in both passes."""
+        for block_scaled in (None, dist_moe.BlockScaledConfig()):
+            with self.subTest(block_scaled=block_scaled is not None):
+                context, case_a, _, base_w13, base_w2 = self._create_case(
+                    inference=False,
+                    block_scaled=block_scaled,
+                )
+                base_x, base_ids, base_scores = case_a
+                ids_TK = base_ids.clone()
+                ids_TK[0] = -1
+                ids_TK[1, 1] = -1
+                scores_TK = base_scores.clone()
+                scores_TK[ids_TK < 0] = 0
+                actual_inputs = tuple(
+                    tensor.detach().clone().requires_grad_()
+                    for tensor in (base_x, scores_TK, base_w13, base_w2)
+                )
+                reference_inputs = tuple(
+                    tensor.detach().clone().requires_grad_()
+                    for tensor in (base_x, scores_TK, base_w13, base_w2)
+                )
+
+                actual_TD = dist_moe.routed_experts(
+                    actual_inputs[0],
+                    ids_TK,
+                    actual_inputs[1],
+                    actual_inputs[2],
+                    actual_inputs[3],
+                    context,
+                    options=dist_moe.ExecutionOptions(validate_expert_ids=True),
+                )
+                reference_TD = _reference_moe(
+                    reference_inputs[0],
+                    ids_TK,
+                    reference_inputs[1],
+                    reference_inputs[2],
+                    reference_inputs[3],
+                )
+                self.assertEqual(torch.count_nonzero(actual_TD[0]).item(), 0)
+
+                grad_TD = torch.randn_like(actual_TD)
+                actual_TD.backward(grad_TD)
+                reference_TD.backward(grad_TD)
+                if block_scaled is None:
+                    torch.testing.assert_close(
+                        actual_TD,
+                        reference_TD,
+                        rtol=3e-2,
+                        atol=3e-2,
+                    )
+                else:
+                    output_tolerance = _blockscaled_tolerance(
+                        block_scaled.format,
+                        "fwd",
+                    )
+                    self.assertLess(
+                        _relative_l2(actual_TD, reference_TD),
+                        output_tolerance[2],
+                    )
+                    self.assertGreater(
+                        _cosine_similarity(actual_TD, reference_TD),
+                        output_tolerance[3],
+                    )
+                for name, actual, expected in zip(
+                    ("x", "scores", "w13", "w2"),
+                    actual_inputs,
+                    reference_inputs,
+                    strict=True,
+                ):
+                    if block_scaled is None:
+                        torch.testing.assert_close(
+                            actual.grad,
+                            expected.grad,
+                            rtol=3e-2,
+                            atol=1.0 if name in ("w13", "w2") else 3e-2,
+                        )
+                    else:
+                        grad_tolerance = _blockscaled_tolerance(
+                            block_scaled.format,
+                            "wgrad" if name in ("w13", "w2") else "grad",
+                        )
+                        self.assertLess(
+                            _relative_l2(actual.grad, expected.grad),
+                            grad_tolerance[2],
+                        )
+                        self.assertGreater(
+                            _cosine_similarity(actual.grad, expected.grad),
+                            grad_tolerance[3],
+                        )
+                self.assertEqual(
+                    torch.count_nonzero(actual_inputs[0].grad[0]).item(),
+                    0,
+                )
+                self.assertEqual(
+                    torch.count_nonzero(actual_inputs[1].grad[ids_TK < 0]).item(),
+                    0,
+                )
+                self._assert_planner_reset(context.activation_buffer)
 
     def test_mxfp8_staged_and_mega_inference_match_reference(self) -> None:
         """Match staged/Mega MXFP8 inference to the dense reference.
@@ -2503,6 +2618,10 @@ class DistMoeKernelTest(unittest.TestCase):
         """
         context, case_a, _, w13_EFD, w2_EDF = self._create_case(inference=False)
         x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+        topk_expert_ids_TK = topk_expert_ids_TK.clone()
+        topk_expert_ids_TK[0] = -1
+        topk_scores_TK = topk_scores_TK.clone()
+        topk_scores_TK[0] = 0
         actual_inputs = tuple(
             tensor.detach().clone().requires_grad_()
             for tensor in (x_TD, topk_scores_TK, w13_EFD, w2_EDF)
@@ -2546,6 +2665,7 @@ class DistMoeKernelTest(unittest.TestCase):
         actual_TD.backward(grad_output_TD)
         expected_TD.backward(grad_output_TD)
 
+        self.assertEqual(torch.count_nonzero(actual_TD[0]).item(), 0)
         torch.testing.assert_close(actual_TD, expected_TD, rtol=2e-2, atol=2e-2)
         for name, actual, expected in zip(
             ("x", "topk_scores", "w13", "w2"),
@@ -2563,9 +2683,13 @@ class DistMoeKernelTest(unittest.TestCase):
         self._assert_planner_reset(context.activation_buffer)
 
     def test_bf16_callback_accumulates_closed_parameter_grad(self) -> None:
-        """Match a learned eager callback and its closed parameter gradient."""
+        """Match callback padding sanitation and its closed parameter gradient."""
         context, case_a, _, w13_EFD, w2_EDF = self._create_case(inference=False)
         x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+        topk_expert_ids_TK = topk_expert_ids_TK.clone()
+        topk_expert_ids_TK[0] = -1
+        topk_scores_TK = topk_scores_TK.clone()
+        topk_scores_TK[0] = 0
         actual_inputs = tuple(
             tensor.detach().clone().requires_grad_()
             for tensor in (x_TD, topk_scores_TK, w13_EFD, w2_EDF)
@@ -2581,6 +2705,15 @@ class DistMoeKernelTest(unittest.TestCase):
         )
         reference_scale_D = scale_D.detach().clone().requires_grad_()
 
+        def callback(h3_MD: torch.Tensor) -> torch.Tensor:
+            """Require Dist-MoE to zero invalid callback-input rows."""
+            h3_TKD = h3_MD.view(*topk_expert_ids_TK.shape, -1)
+            self.assertEqual(
+                torch.count_nonzero(h3_TKD[topk_expert_ids_TK < 0]).item(),
+                0,
+            )
+            return h3_MD * scale_D
+
         actual_TD = dist_moe.routed_experts(
             actual_inputs[0],
             topk_expert_ids_TK,
@@ -2589,7 +2722,8 @@ class DistMoeKernelTest(unittest.TestCase):
             actual_inputs[3],
             context,
             options=dist_moe.ExecutionOptions(
-                experts_output_postprocess=lambda h3_RD: h3_RD * scale_D
+                experts_output_postprocess=callback,
+                zero_out_padded_callback_inputs=True,
             ),
         )
         expected_TD = _reference_moe(
@@ -2768,7 +2902,7 @@ class DistMoeKernelTest(unittest.TestCase):
             and node.target is torch.ops.dist_moe.bf16_forward_with_clip_stats.default
         ]
         self.assertEqual(len(custom_ops), 1)
-        self.assertEqual(len(custom_ops[0].args), 18)
+        self.assertEqual(len(custom_ops[0].args), 19)
         self.assertTrue(
             any(
                 node.op == "call_function"
@@ -2854,6 +2988,7 @@ class DistMoeKernelTest(unittest.TestCase):
                     *supplied[1:],
                     None,
                     7.0,
+                    False,
                     context.context_id,
                 )
 
@@ -2876,6 +3011,7 @@ class DistMoeKernelTest(unittest.TestCase):
                 *storages[1:],
                 None,
                 7.0,
+                False,
                 context.context_id,
             )
 
@@ -3107,6 +3243,9 @@ class DistMoeKernelTest(unittest.TestCase):
         static_x_TD, static_ids_TK, static_scores_TK = (
             tensor.clone() for tensor in case_a
         )
+        padded_case = tuple(tensor.clone() for tensor in case_b)
+        padded_case[1][-1] = -1
+        padded_case[2][-1] = 0
         stats_out_3 = torch.full((3,), -1, dtype=torch.float32, device="cuda")
         options = dist_moe.ExecutionOptions(
             swiglu_clip_stats_out_3=stats_out_3,
@@ -3135,7 +3274,7 @@ class DistMoeKernelTest(unittest.TestCase):
                     options=options,
                 )
 
-        for x_TD, ids_TK, scores_TK in (case_a, case_b):
+        for x_TD, ids_TK, scores_TK in (case_a, case_b, padded_case):
             static_x_TD.copy_(x_TD)
             static_ids_TK.copy_(ids_TK)
             static_scores_TK.copy_(scores_TK)
@@ -3606,6 +3745,9 @@ class DistMoeKernelTest(unittest.TestCase):
     def test_inference_cuda_graphs_replay_bounded_shapes(self) -> None:
         """One context backs fixed CUDA graphs at multiple bounded T values."""
         context, case_a, case_b, w13, w2 = self._create_case()
+        padded_case = tuple(tensor.clone() for tensor in case_b)
+        padded_case[1][-1] = -1
+        padded_case[2][-1] = 0
         captures = []
         for num_tokens in (4, 8):
             static_inputs = tuple(
@@ -3624,7 +3766,7 @@ class DistMoeKernelTest(unittest.TestCase):
             captures.append((num_tokens, static_inputs, graph, captured_output))
 
         for num_tokens, static_inputs, graph, captured_output in captures:
-            for values in (case_a, case_b):
+            for values in (case_a, padded_case):
                 inputs = tuple(tensor[:num_tokens].contiguous() for tensor in values)
                 for static, value in zip(static_inputs, inputs, strict=True):
                     static.copy_(value)
@@ -3658,6 +3800,9 @@ class DistMoeKernelTest(unittest.TestCase):
         static_x_TD, static_ids_TK, static_scores_TK = (
             tensor.clone() for tensor in case_a
         )
+        padded_case = tuple(tensor.clone() for tensor in case_b)
+        padded_case[1][-1] = -1
+        padded_case[2][-1] = 0
         prepared_w13 = dist_moe.prepare_block_scaled_weight(w13_E2FD, policy)
         prepared_w2 = dist_moe.prepare_block_scaled_weight(w2_EDF, policy)
 
@@ -3683,7 +3828,7 @@ class DistMoeKernelTest(unittest.TestCase):
                 )
 
             replayed_outputs = []
-            for x_TD, ids_TK, scores_TK in (case_a, case_b):
+            for x_TD, ids_TK, scores_TK in (case_a, case_b, padded_case):
                 static_x_TD.copy_(x_TD)
                 static_ids_TK.copy_(ids_TK)
                 static_scores_TK.copy_(scores_TK)
@@ -3699,6 +3844,8 @@ class DistMoeKernelTest(unittest.TestCase):
                     context,
                 )
                 torch.testing.assert_close(actual_TD, expected_TD, rtol=0, atol=0)
+                if torch.all(ids_TK[-1] < 0):
+                    self.assertEqual(torch.count_nonzero(actual_TD[-1]).item(), 0)
                 replayed_outputs.append(actual_TD)
             self.assertFalse(torch.equal(replayed_outputs[0], replayed_outputs[1]))
 
@@ -4058,6 +4205,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
         accumulate_execution: bool = False,
         parameter_grad_dtype: torch.dtype = torch.bfloat16,
         max_num_tokens: int | None = None,
+        padding_rank: int | None = None,
     ) -> None:
         """Run one precision through real peer dispatch and combine paths.
 
@@ -4076,6 +4224,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 backward into the existing expert gradients.
             parameter_grad_dtype: Dtype declared by both expert parameters.
             max_num_tokens: Optional context capacity above the actual input T.
+            padding_rank: Optional rank whose every route is inactive.
         """
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
@@ -4097,6 +4246,8 @@ class DistMoeTwoRankTest(unittest.TestCase):
             (first_expert, (first_expert + num_local_experts) % num_experts),
             dim=1,
         ).to(torch.int64)
+        if rank == padding_rank:
+            ids.fill_(-1)
 
         torch.manual_seed(1000 + rank)
         x = torch.randn(
@@ -4115,6 +4266,9 @@ class DistMoeTwoRankTest(unittest.TestCase):
             dtype=torch.float32,
         )
         scores = (scores / scores.sum(dim=1, keepdim=True)).requires_grad_()
+        if rank == padding_rank:
+            with torch.no_grad():
+                scores.zero_()
         grad_output = torch.randn_like(x)
 
         # Generate identical global weights on both ranks, then give the fused
@@ -4207,6 +4361,8 @@ class DistMoeTwoRankTest(unittest.TestCase):
                     context,
                     options=options,
                 )
+            if rank == padding_rank:
+                self.assertEqual(torch.count_nonzero(actual).item(), 0)
 
             global_actual = _all_gather_cat(actual.detach())
             global_x = _all_gather_cat(x.detach()).requires_grad_()
@@ -4425,6 +4581,16 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 self._run_two_rank_numerics(
                     block_scaled,
                     max_num_tokens=256,
+                )
+
+    @with_comms
+    def test_fully_padded_rank_exercises_peer_paths(self) -> None:
+        """A rank with only `-1` routes contributes no BF16/MXFP8 work."""
+        for block_scaled in (None, dist_moe.BlockScaledConfig()):
+            with self.subTest(block_scaled=block_scaled is not None):
+                self._run_two_rank_numerics(
+                    block_scaled,
+                    padding_rank=1,
                 )
 
     @with_comms

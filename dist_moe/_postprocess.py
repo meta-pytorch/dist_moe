@@ -318,6 +318,7 @@ def _validate_experts_output_postprocess_type(
 
 def _fused_post_expert_rmsnorm(
     h3_MD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     config: RMSNormPostprocess,
     *,
@@ -328,6 +329,7 @@ def _fused_post_expert_rmsnorm(
 
     Args:
         h3_MD: Route-wise W2 output with shape ``[T * K, D]``.
+        topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
         topk_scores_TK: Router scores with shape ``[T, K]``.
         config: Validated fused RMSNorm policy.
         num_tokens: Local token count ``T``.
@@ -338,12 +340,13 @@ def _fused_post_expert_rmsnorm(
     """
     # Import lazily so CPU-only processes do not require libcuda.
     from .kernels.norm.fused_rmsnorm_combine import (
-        fused_rmsnorm_combine,
+        _fused_rmsnorm_combine_fwd,
     )
 
-    return fused_rmsnorm_combine(
+    output_TD, _ = _fused_rmsnorm_combine_fwd(
         h3_MD.reshape(num_tokens, topk, -1),
         topk_scores_TK,
+        expert_ids=topk_expert_ids_TK,
         eps=config.eps,
         norm_output_dtype=config.norm_output_dtype,
         output_dtype=config.output_dtype,
@@ -352,10 +355,12 @@ def _fused_post_expert_rmsnorm(
         weight=config.weight,
         gain_center=config.gain_center,
     )
+    return output_TD
 
 
 def _fused_post_expert_rmsnorm_with_input_copy(
     h3_MD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     config: RMSNormPostprocess,
     *,
@@ -366,6 +371,7 @@ def _fused_post_expert_rmsnorm_with_input_copy(
 
     Args:
         h3_MD: Route-wise W2 output with shape ``[T * K, D]``.
+        topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
         topk_scores_TK: Router scores with shape ``[T, K]``.
         config: Validated fused RMSNorm policy.
         num_tokens: Local token count ``T``.
@@ -383,6 +389,7 @@ def _fused_post_expert_rmsnorm_with_input_copy(
     output_TD, rstd_TK = _fused_rmsnorm_combine_fwd(
         h3_TKD,
         topk_scores_TK,
+        expert_ids=topk_expert_ids_TK,
         eps=config.eps,
         use_kahan=config.use_kahan,
         norm_output_dtype=config.norm_output_dtype,
@@ -395,6 +402,7 @@ def _fused_post_expert_rmsnorm_with_input_copy(
 
 def _fused_post_expert_rmsnorm_with_context(
     h3_MD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     config: RMSNormPostprocess,
     *,
@@ -405,6 +413,7 @@ def _fused_post_expert_rmsnorm_with_context(
 
     Args:
         h3_MD: Stable route-wise W2 output with shape ``[T * K, D]``.
+        topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
         topk_scores_TK: Router scores with shape ``[T, K]``.
         config: Validated fused RMSNorm policy.
         num_tokens: Local token count ``T``.
@@ -420,6 +429,7 @@ def _fused_post_expert_rmsnorm_with_context(
     return _fused_rmsnorm_combine_fwd(
         h3_MD.reshape(num_tokens, topk, -1),
         topk_scores_TK,
+        expert_ids=topk_expert_ids_TK,
         eps=config.eps,
         use_kahan=config.use_kahan,
         norm_output_dtype=config.norm_output_dtype,
@@ -431,6 +441,7 @@ def _fused_post_expert_rmsnorm_with_context(
 def _fused_post_expert_rmsnorm_backward_to(
     grad_output_TD: torch.Tensor,
     h3_MD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     grad_h3_output_MD: torch.Tensor,
     rstd_TK: torch.Tensor | None,
@@ -444,6 +455,7 @@ def _fused_post_expert_rmsnorm_backward_to(
     Args:
         grad_output_TD: Gradient of the reduced output with shape ``[T, D]``.
         h3_MD: Saved or recomputed route output with shape ``[T * K, D]``.
+        topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
         topk_scores_TK: Router scores with shape ``[T, K]``.
         grad_h3_output_MD: Destination for the route gradient.
         rstd_TK: Reciprocal RMS context from forward, or ``None`` when recomputed.
@@ -474,6 +486,7 @@ def _fused_post_expert_rmsnorm_backward_to(
         require_bitwise=config.require_bitwise,
         use_kahan=config.use_kahan,
         grad_x=grad_h3_output_MD.reshape_as(h3_TKD),
+        expert_ids=topk_expert_ids_TK,
     )
     if not topk_scores_TK.requires_grad:
         grad_topk_scores_TK.zero_()
@@ -483,6 +496,7 @@ def _fused_post_expert_rmsnorm_backward_to(
 def _scale_and_sum(
     x_TKD: torch.Tensor,
     scale_TK: torch.Tensor,
+    expert_ids_TK: torch.Tensor,
     *,
     return_copy: bool,
     output_dtype: torch.dtype,
@@ -495,6 +509,8 @@ def _scale_and_sum(
     Args:
         x_TKD: Route output with shape ``[T, K, D]``.
         scale_TK: Router scores with shape ``[T, K]``.
+        expert_ids_TK: Global expert IDs with shape ``[T, K]``. Negative routes
+            are inactive.
         return_copy: Whether to return a standalone copy for backward.
         output_dtype: Dtype of the reduced output.
         x_copy_buffer: Optional activation buffer containing the saved copy.
@@ -510,6 +526,7 @@ def _scale_and_sum(
         return scale_and_sum(
             x=x_TKD,
             scale=scale_TK,
+            expert_ids=expert_ids_TK,
             return_copy=return_copy,
             output_dtype=output_dtype,
             x_copy_buffer=x_copy_buffer,
@@ -520,13 +537,16 @@ def _scale_and_sum(
     assert x_copy_buffer is None
     assert x_copy_offset is None
     assert x_copy_condition is None
-    output_TD = (x_TKD * scale_TK.unsqueeze(-1)).sum(dim=1).to(output_dtype)
-    return output_TD, x_TKD.clone() if return_copy else None
+    valid_TK = expert_ids_TK >= 0
+    masked_x_TKD = torch.where(valid_TK.unsqueeze(-1), x_TKD, 0)
+    output_TD = (masked_x_TKD * scale_TK.unsqueeze(-1)).sum(dim=1).to(output_dtype)
+    return output_TD, masked_x_TKD.clone() if return_copy else None
 
 
 def _reduction_backward(
     grad_output_TD: torch.Tensor,
     scores_TK: torch.Tensor,
+    expert_ids_TK: torch.Tensor,
     x_TKD: torch.Tensor,
     *,
     reduction_input_dtype: torch.dtype,
@@ -540,6 +560,8 @@ def _reduction_backward(
     Args:
         grad_output_TD: Gradient of the reduced output with shape ``[T, D]``.
         scores_TK: Router scores with shape ``[T, K]``.
+        expert_ids_TK: Global expert IDs with shape ``[T, K]``. Negative routes
+            receive zero gradients.
         x_TKD: Saved route output with shape ``[T, K, D]``.
         reduction_input_dtype: Dtype used by forward score reduction.
         out_TKD: Optional destination for the route gradient.
@@ -557,9 +579,16 @@ def _reduction_backward(
         assert x_buffer is None
         assert x_buffer_offset is None
         assert x_buffer_condition is None
-        grad_x_TKD = grad_output_TD.unsqueeze(1) * scores_TK.unsqueeze(-1)
+        valid_TK = expert_ids_TK >= 0
+        grad_x_TKD = torch.where(
+            valid_TK.unsqueeze(-1),
+            grad_output_TD.unsqueeze(1) * scores_TK.unsqueeze(-1),
+            0,
+        )
         grad_scores_TK = (
-            (grad_output_TD.unsqueeze(1) * x_TKD).sum(dim=-1).to(scores_TK.dtype)
+            torch.where(valid_TK.unsqueeze(-1), grad_output_TD.unsqueeze(1) * x_TKD, 0)
+            .sum(dim=-1)
+            .to(scores_TK.dtype)
         )
         if out_TKD is not None:
             out_TKD.copy_(grad_x_TKD)
@@ -570,6 +599,7 @@ def _reduction_backward(
         dy=grad_output_TD,
         scale=scores_TK,
         x=x_TKD,
+        expert_ids=expert_ids_TK,
         dx=out_TKD,
         x_buffer=x_buffer,
         x_buffer_offset=x_buffer_offset,
@@ -738,8 +768,10 @@ def _resolve_experts_output_postprocess_fn(
     experts_output_postprocess: _ExpertsOutputPostprocess | _ResolvedExpertsPostprocess,
     *,
     x_TD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     inference_mode: bool = False,
+    zero_out_padded_callback_inputs: bool = False,
 ) -> _ResolvedExpertsPostprocess:
     """Resolve the public postprocess value to straight-line execution hooks.
 
@@ -747,8 +779,11 @@ def _resolve_experts_output_postprocess_fn(
         experts_output_postprocess: Public callback, RMSNorm config, ``None``,
             or an already resolved private runtime value.
         x_TD: Dist-MoE input, which defines output dtype and hidden width.
+        topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
         topk_scores_TK: Router scores with shape ``[T, K]``.
         inference_mode: Whether backward is disabled.
+        zero_out_padded_callback_inputs: Whether Python callbacks receive zeroed
+            invalid route rows.
 
     Returns:
         Forward/backward hooks for exactly one supported execution variant.
@@ -759,23 +794,36 @@ def _resolve_experts_output_postprocess_fn(
     _validate_experts_output_postprocess_type(experts_output_postprocess)
     num_tokens, topk = topk_scores_TK.shape
     if experts_output_postprocess is None:
-        return _resolve_reduction_only(num_tokens, topk)
+        return _resolve_reduction_only(num_tokens, topk, topk_expert_ids_TK)
     if callable(experts_output_postprocess):
-        return _resolve_callback(experts_output_postprocess, num_tokens, topk)
+        return _resolve_callback(
+            experts_output_postprocess,
+            num_tokens,
+            topk,
+            topk_expert_ids_TK,
+            zero_out_padded_inputs=zero_out_padded_callback_inputs,
+        )
     return _resolve_rmsnorm_config(
         experts_output_postprocess,
         x_TD=x_TD,
+        topk_expert_ids_TK=topk_expert_ids_TK,
         topk_scores_TK=topk_scores_TK,
         inference_mode=inference_mode,
+        zero_out_padded_callback_inputs=zero_out_padded_callback_inputs,
     )
 
 
-def _resolve_reduction_only(num_tokens: int, topk: int) -> _ResolvedExpertsPostprocess:
+def _resolve_reduction_only(
+    num_tokens: int,
+    topk: int,
+    expert_ids_TK: torch.Tensor,
+) -> _ResolvedExpertsPostprocess:
     """Resolve the plain top-k scale-and-sum stage.
 
     Args:
         num_tokens: Local token count ``T``.
         topk: Routes per token ``K``.
+        expert_ids_TK: Routed expert IDs defining active routes.
 
     Returns:
         Forward and backward hooks for reduction without postprocessing.
@@ -813,6 +861,7 @@ def _resolve_reduction_only(num_tokens: int, topk: int) -> _ResolvedExpertsPostp
             output_TD, _ = _scale_and_sum(
                 x_TKD=h3_TKD,
                 scale_TK=scores_TK,
+                expert_ids_TK=expert_ids_TK,
                 return_copy=False,
                 output_dtype=output_dtype,
                 x_copy_buffer=save_buffer,
@@ -826,6 +875,7 @@ def _resolve_reduction_only(num_tokens: int, topk: int) -> _ResolvedExpertsPostp
             output_TD, _ = _scale_and_sum(
                 x_TKD=h3_TKD,
                 scale_TK=scores_TK,
+                expert_ids_TK=expert_ids_TK,
                 return_copy=False,
                 output_dtype=output_dtype,
             )
@@ -833,6 +883,7 @@ def _resolve_reduction_only(num_tokens: int, topk: int) -> _ResolvedExpertsPostp
         output_TD, h3_saved_TKD = _scale_and_sum(
             x_TKD=h3_TKD,
             scale_TK=scores_TK,
+            expert_ids_TK=expert_ids_TK,
             return_copy=save,
             output_dtype=output_dtype,
         )
@@ -877,6 +928,7 @@ def _resolve_reduction_only(num_tokens: int, topk: int) -> _ResolvedExpertsPostp
         grad_h3_TKD, grad_scores_TK = _reduction_backward(
             grad_output_TD,
             scores_TK,
+            expert_ids_TK,
             h3_saved_TKD,
             reduction_input_dtype=postprocess_output_dtype,
             out_TKD=grad_h3_output_TKD,
@@ -939,7 +991,12 @@ def _validate_callback_output(
 
 
 def _resolve_callback(
-    fn: _ExpertsOutputPostprocessFn, num_tokens: int, topk: int
+    fn: _ExpertsOutputPostprocessFn,
+    num_tokens: int,
+    topk: int,
+    expert_ids_TK: torch.Tensor,
+    *,
+    zero_out_padded_inputs: bool,
 ) -> _ResolvedExpertsPostprocess:
     """Transform callback (e.g. an unfused norm), then the plain reduction.
 
@@ -957,11 +1014,14 @@ def _resolve_callback(
         fn: Route-wise eager callback.
         num_tokens: Local token count ``T``.
         topk: Routes per token ``K``.
+        expert_ids_TK: Routed expert IDs defining active routes.
+        zero_out_padded_inputs: Whether invalid route rows are zeroed before
+            invoking the callback.
 
     Returns:
         Straight-line eager forward and backward callback handlers.
     """
-    from ._triton_ops import conditional_copy_activations
+    from ._triton_ops import conditional_copy_activations, zero_out_padded_rows_
     from .kernels.triton.broadcast_n_reduction import scale_and_sum
 
     def forward(
@@ -991,6 +1051,8 @@ def _resolve_callback(
             Output, optional saved callback input, no auxiliary context, and
             the callback-output dtype used by reduction.
         """
+        if zero_out_padded_inputs:
+            zero_out_padded_rows_(h3_MD, expert_ids_TK)
         h3_saved_MD = None
         if save:
             if save_buffer is not None:
@@ -1011,6 +1073,7 @@ def _resolve_callback(
         output_TD, _ = scale_and_sum(
             x=h3_postprocessed_MD.view(num_tokens, topk, -1),
             scale=scores_TK,
+            expert_ids=expert_ids_TK,
             return_copy=False,
             output_dtype=output_dtype,
         )
@@ -1047,6 +1110,8 @@ def _resolve_callback(
             Callback-input gradient, router-score gradient, and ``False``
             because the gradient has not been published.
         """
+        if zero_out_padded_inputs:
+            zero_out_padded_rows_(h3_saved_MD, expert_ids_TK)
         h3_pre_MD = h3_saved_MD.detach().requires_grad_(True)
         with torch.enable_grad():
             h3_postprocessed_MD = fn(h3_pre_MD)
@@ -1059,6 +1124,7 @@ def _resolve_callback(
         grad_h3_post_TKD, grad_scores_TK = _reduction_backward(
             grad_output_TD,
             scores_TK,
+            expert_ids_TK,
             h3_postprocessed_TKD,
             reduction_input_dtype=postprocess_output_dtype,
         )
@@ -1128,21 +1194,26 @@ def _resolve_rmsnorm_config(
     config: RMSNormPostprocess,
     *,
     x_TD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     inference_mode: bool,
+    zero_out_padded_callback_inputs: bool,
 ) -> _ResolvedExpertsPostprocess:
     """Resolve fused RMSNorm plus scale-and-sum execution hooks.
 
     Args:
         config: Public fused RMSNorm policy.
         x_TD: Dist-MoE input that defines the output dtype and hidden width.
+        topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
         topk_scores_TK: Router scores with shape ``[T, K]``.
         inference_mode: Whether backward is disabled.
+        zero_out_padded_callback_inputs: Whether observer callbacks receive
+            zeroed invalid route rows.
 
     Returns:
         Validated forward and backward hooks for fused RMSNorm reduction.
     """
-    from ._triton_ops import conditional_copy_activations
+    from ._triton_ops import conditional_copy_activations, zero_out_padded_rows_
 
     num_tokens, topk = topk_scores_TK.shape
     _validate_rmsnorm_postprocess(
@@ -1171,6 +1242,8 @@ def _resolve_rmsnorm_config(
             h3_MD: Route-wise W2 output before normalization.
         """
         if config.observe_expert_output_fn is not None:
+            if zero_out_padded_callback_inputs:
+                zero_out_padded_rows_(h3_MD, topk_expert_ids_TK)
             config.observe_expert_output_fn(h3_MD)
 
     def forward(
@@ -1208,7 +1281,12 @@ def _resolve_rmsnorm_config(
         observe_forward(h3_MD)
         if not save:
             output_TD = _fused_post_expert_rmsnorm(
-                h3_MD, scores_TK, config, num_tokens=num_tokens, topk=topk
+                h3_MD,
+                topk_expert_ids_TK,
+                scores_TK,
+                config,
+                num_tokens=num_tokens,
+                topk=topk,
             )
             return output_TD, None, None, config.output_dtype
         if save_buffer is not None:
@@ -1222,7 +1300,12 @@ def _resolve_rmsnorm_config(
                 copy_to_buffer=True,
             )
             output_TD, rstd_TK = _fused_post_expert_rmsnorm_with_context(
-                h3_MD, scores_TK, config, num_tokens=num_tokens, topk=topk
+                h3_MD,
+                topk_expert_ids_TK,
+                scores_TK,
+                config,
+                num_tokens=num_tokens,
+                topk=topk,
             )
             return (
                 output_TD,
@@ -1235,7 +1318,12 @@ def _resolve_rmsnorm_config(
             # backend's materialized combine output), so saving it directly
             # avoids a second full-activation copy.
             output_TD, rstd_TK = _fused_post_expert_rmsnorm_with_context(
-                h3_MD, scores_TK, config, num_tokens=num_tokens, topk=topk
+                h3_MD,
+                topk_expert_ids_TK,
+                scores_TK,
+                config,
+                num_tokens=num_tokens,
+                topk=topk,
             )
             return (
                 output_TD,
@@ -1244,7 +1332,12 @@ def _resolve_rmsnorm_config(
                 config.output_dtype,
             )
         output_TD, h3_saved_MD, rstd_TK = _fused_post_expert_rmsnorm_with_input_copy(
-            h3_MD, scores_TK, config, num_tokens=num_tokens, topk=topk
+            h3_MD,
+            topk_expert_ids_TK,
+            scores_TK,
+            config,
+            num_tokens=num_tokens,
+            topk=topk,
         )
         return (
             output_TD,
@@ -1284,6 +1377,11 @@ def _resolve_rmsnorm_config(
             gradient was written directly to ``publish_view``.
         """
         validate_inputs(h3_saved_MD, scores_TK)
+        if (
+            zero_out_padded_callback_inputs
+            and config.observe_expert_output_grad_fn is not None
+        ):
+            zero_out_padded_rows_(h3_saved_MD, topk_expert_ids_TK)
         grad_h3_output_MD, published = _grad_publish_target(
             publish_view,
             h3_saved_MD,
@@ -1292,6 +1390,7 @@ def _resolve_rmsnorm_config(
         grad_h3_MD, grad_scores_TK = _fused_post_expert_rmsnorm_backward_to(
             grad_output_TD,
             h3_saved_MD,
+            topk_expert_ids_TK,
             scores_TK,
             grad_h3_output_MD,
             context,

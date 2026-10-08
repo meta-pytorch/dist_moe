@@ -30,6 +30,15 @@ behaviors:
 Routing scores and top-k expert IDs are inputs to Dist-MoE. Routing itself is
 not part of postprocessing and is not computed by these kernels.
 
+An expert ID of `-1` disables one route. Plain reduction and typed RMSNorm use
+the IDs as inline load predicates, so they neither read stale route storage nor
+materialize a separate mask. Their forward and backward outputs are zero for
+inactive routes. Python callbacks and observers are eager extension points:
+when padding is possible, set
+`ExecutionOptions.zero_out_padded_callback_inputs=True` to zero invalid `h3`
+rows before user code. With the option disabled, callbacks require a caller
+guarantee that no route is padded.
+
 <a id="follow-one-token"></a>
 ## Follow one token
 

@@ -201,6 +201,64 @@ def _run_capacity_overflow_worker(*, block_scaled: bool) -> None:
     raise AssertionError("routing beyond total scratch capacity did not trap")
 
 
+def _run_invalid_expert_id_worker(*, block_scaled: bool, expert_id: int) -> None:
+    """Enable debug validation and require one invalid ID to device-trap."""
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl")
+    num_tokens, hidden_dim, intermediate_dim = 128, 256, 256
+    config = dist_moe.Config(
+        max_num_local_input_tokens=num_tokens,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+        top_k=1,
+        num_experts=dist.get_world_size(),
+        max_moe_layers_per_activation_slot=1,
+        num_activation_slots=0 if block_scaled else 1,
+        block_scaled=dist_moe.BlockScaledConfig() if block_scaled else None,
+        inference=block_scaled,
+    )
+    context = dist_moe.create_context(
+        group=dist.group.WORLD,
+        config=config,
+        device=device,
+    )
+    x_TD, topk_expert_ids_TK, topk_scores_TK, w13_EFD, w2_EDF = _make_inputs(
+        num_tokens=num_tokens,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+        requires_grad=False,
+    )
+    topk_expert_ids_TK.fill_(expert_id)
+    if block_scaled:
+        assert config.block_scaled is not None
+        w13_operand = dist_moe.prepare_block_scaled_weight(
+            w13_EFD,
+            config.block_scaled,
+            inference=True,
+        )
+        w2_operand = dist_moe.prepare_block_scaled_weight(
+            w2_EDF,
+            config.block_scaled,
+            inference=True,
+        )
+    else:
+        w13_operand, w2_operand = w13_EFD, w2_EDF
+    with torch.no_grad():
+        dist_moe.routed_experts(
+            x_TD,
+            topk_expert_ids_TK,
+            topk_scores_TK,
+            w13_operand,
+            w2_operand,
+            context,
+            options=dist_moe.ExecutionOptions(validate_expert_ids=True),
+        )
+    torch.cuda.synchronize(device)
+    raise AssertionError("invalid expert ID did not trigger a device trap")
+
+
 @pytest.mark.gpus_needed_4
 @pytest.mark.gb10x
 @pytest.mark.parametrize("inference", (False, True))
@@ -252,6 +310,35 @@ def test_scratch_capacity_overflow_traps_before_execution(
     assert "illegal memory access" not in output.lower(), output
 
 
+@pytest.mark.gpus_needed_4
+@pytest.mark.gb10x
+@pytest.mark.parametrize(
+    ("block_scaled", "expert_id"),
+    ((False, -2), (True, 4)),
+)
+def test_debug_expert_id_validation_traps(
+    block_scaled: bool,
+    expert_id: int,
+) -> None:
+    """Cover fused dense and routing-only publication validation."""
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--local-addr=127.0.0.1",
+        "--nproc-per-node=4",
+        str(Path(__file__).resolve()),
+        "--worker",
+        f"--invalid-id={expert_id}",
+        *(["--block-scaled"] if block_scaled else []),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert "DistMoE expert ID is outside [-1, num_experts)" in output, output
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true", required=True)
@@ -259,9 +346,15 @@ if __name__ == "__main__":
     mode.add_argument("--training", action="store_true")
     mode.add_argument("--inference", action="store_true")
     mode.add_argument("--capacity-overflow", action="store_true")
+    mode.add_argument("--invalid-id", type=int)
     parser.add_argument("--block-scaled", action="store_true")
     args = parser.parse_args()
-    if args.capacity_overflow:
+    if args.invalid_id is not None:
+        _run_invalid_expert_id_worker(
+            block_scaled=args.block_scaled,
+            expert_id=args.invalid_id,
+        )
+    elif args.capacity_overflow:
         _run_capacity_overflow_worker(block_scaled=args.block_scaled)
     else:
         _run_mismatched_worker(inference=args.inference)

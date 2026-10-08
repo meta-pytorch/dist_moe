@@ -66,6 +66,8 @@ def _compile_fwd(
     tile_d,
     copy_input,
     has_weight,
+    expert_id_dtype,
+    has_expert_ids,
 ):
     batch_sym = cute.sym_int()
     batch_topk_sym = cute.sym_int()
@@ -76,6 +78,9 @@ def _compile_fwd(
     rstd_cute = fake_tensor(Float32, (batch_topk_sym,))
     x_copy_cute = fake_tensor(dtype, (batch_topk_sym, N), div)
     g_cute = fake_tensor(dtype, (1, N), div) if has_weight else None
+    expert_ids_cute = (
+        fake_tensor(expert_id_dtype, (batch_topk_sym,)) if has_expert_ids else None
+    )
     kernel = FusedRMSNormCombineFwd(
         dtype,
         norm_dtype,
@@ -86,6 +91,7 @@ def _compile_fwd(
         tile_d=tile_d,
         copy_input=copy_input,
         has_weight=has_weight,
+        has_expert_ids=has_expert_ids,
     )
     if not kernel.can_implement(
         x_cute,
@@ -94,6 +100,7 @@ def _compile_fwd(
         rstd_cute,
         x_copy_cute,
         g_cute,
+        expert_ids_cute,
     ):
         raise ValueError(
             "FusedRMSNormCombineFwd requires 16-byte aligned "
@@ -108,6 +115,7 @@ def _compile_fwd(
         rstd_cute,
         x_copy_cute,
         g_cute,
+        expert_ids_cute,
         Float32(0),  # eps
         Float32(0),  # gain_center
         make_fake_stream(),
@@ -157,6 +165,8 @@ def _compile_bwd(
     N,
     TOPK,
     use_exact_kernel,
+    expert_id_dtype,
+    has_expert_ids,
 ):
     batch_sym = cute.sym_int()
     batch_topk_sym = cute.sym_int()
@@ -172,10 +182,19 @@ def _compile_bwd(
     rstd_cute = fake_tensor(Float32, (batch_topk_sym,))
     grad_x_cute = fake_tensor(dtype, (batch_topk_sym, N), div)
     grad_w_cute = fake_tensor(Float32, (batch_topk_sym,))
+    expert_ids_cute = (
+        fake_tensor(expert_id_dtype, (batch_topk_sym,)) if has_expert_ids else None
+    )
     kernel_cls = (
         FusedRMSNormCombineBwdExact if use_exact_kernel else FusedRMSNormCombineBwd
     )
-    kernel = kernel_cls(dtype, grad_y_dtype, N, TOPK)
+    kernel = kernel_cls(
+        dtype,
+        grad_y_dtype,
+        N,
+        TOPK,
+        has_expert_ids=has_expert_ids,
+    )
     if not kernel.can_implement(
         grad_y_cute,
         x_cute,
@@ -183,6 +202,7 @@ def _compile_bwd(
         rstd_cute,
         grad_x_cute,
         grad_w_cute,
+        expert_ids_cute,
     ):
         raise ValueError(
             "FusedRMSNormCombineBwd cannot implement the requested dtype widths "
@@ -198,6 +218,7 @@ def _compile_bwd(
         rstd_cute,
         grad_x_cute,
         grad_w_cute,
+        expert_ids_cute,
         make_fake_stream(),
         options="--enable-tvm-ffi",
     )
@@ -286,6 +307,7 @@ def _rmsnorm_weighted_topk_reduction_unfused_fwd(
     output_dtype: torch.dtype,
     weight: Tensor | None = None,
     gain_center: float = 0.0,
+    expert_ids: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     B, TOPK, DIM = x.shape
     x_2d = x.reshape(B * TOPK, DIM)
@@ -301,6 +323,7 @@ def _rmsnorm_weighted_topk_reduction_unfused_fwd(
     y, _ = scale_and_sum(
         x=x_norm_3d,
         scale=weights,
+        expert_ids=expert_ids,
         return_copy=False,
         output_dtype=output_dtype,
     )
@@ -319,6 +342,7 @@ def _fused_rmsnorm_combine_fwd(
     x_copy: Tensor | None = None,
     weight: Tensor | None = None,
     gain_center: float = 0.0,
+    expert_ids: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Launch the fused forward kernel.
 
@@ -336,6 +360,8 @@ def _fused_rmsnorm_combine_fwd(
             per-element rounding as ``cute_rmsnorm_fwd(input_scale=True)``.
             Forward-only: no backward kernel consumes it.
         gain_center: Additive center folded into ``weight`` in-kernel.
+        expert_ids: Optional ``[B, TOPK]`` route IDs. Negative routes are
+            excluded from normalization and reduction.
 
     Returns:
         (y, rstd) where y is [B, DIM] bf16 and rstd is [B, TOPK] f32.
@@ -352,6 +378,15 @@ def _fused_rmsnorm_combine_fwd(
     ):
         raise ValueError(
             "x_copy must be a contiguous tensor matching x's shape, dtype, and device"
+        )
+    if expert_ids is not None and (
+        expert_ids.shape != x.shape[:2]
+        or expert_ids.dtype not in (torch.int32, torch.int64)
+        or expert_ids.device != x.device
+        or not expert_ids.is_contiguous()
+    ):
+        raise ValueError(
+            "expert_ids must be contiguous int32/int64 with shape [B, TOPK]"
         )
     if weight is not None:
         _validate_input_scale_weight(x, weight)
@@ -379,6 +414,7 @@ def _fused_rmsnorm_combine_fwd(
             output_dtype=output_dtype,
             weight=weight,
             gain_center=gain_center,
+            expert_ids=expert_ids,
         )
         if x_copy is not None:
             x_copy.copy_(x)
@@ -389,6 +425,7 @@ def _fused_rmsnorm_combine_fwd(
     x_copy_2d = x_2d if x_copy is None else x_copy.reshape(B * TOPK, DIM)
     w_flat = weights.reshape(B * TOPK)
     g_2d = None if weight is None else weight.reshape(1, DIM)
+    expert_ids_flat = None if expert_ids is None else expert_ids.reshape(B * TOPK)
 
     y = torch.empty(B, DIM, dtype=output_dtype, device=x.device)
     rstd = torch.empty(B * TOPK, dtype=torch.float32, device=x.device)
@@ -397,6 +434,9 @@ def _fused_rmsnorm_combine_fwd(
     norm_dtype = torch2cute_dtype_map[norm_output_dtype]
     out_dtype = torch2cute_dtype_map[output_dtype]
     weight_dtype = torch2cute_dtype_map[weights.dtype]
+    expert_id_dtype = (
+        None if expert_ids is None else torch2cute_dtype_map[expert_ids.dtype]
+    )
     with ensure_cuda_driver_context():
         _compile_fwd(
             dtype,
@@ -410,7 +450,19 @@ def _fused_rmsnorm_combine_fwd(
             B <= SCALE_AND_SUM_TILE_D_MAX_TOKENS,
             x_copy is not None,
             weight is not None,
-        )(x_2d, w_flat, y, rstd, x_copy_2d, g_2d, eps, gain_center)
+            expert_id_dtype,
+            expert_ids is not None,
+        )(
+            x_2d,
+            w_flat,
+            y,
+            rstd,
+            x_copy_2d,
+            g_2d,
+            expert_ids_flat,
+            eps,
+            gain_center,
+        )
 
     return y, rstd.reshape(B, TOPK)
 
@@ -425,6 +477,7 @@ def _fused_rmsnorm_combine_bwd(
     require_bitwise: bool = True,
     use_kahan: bool = False,
     grad_x: Tensor | None = None,
+    expert_ids: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Launch the fused backward kernel.
 
@@ -445,12 +498,23 @@ def _fused_rmsnorm_combine_bwd(
             sum-of-squares needs it, or the gradients belong to a different
             normalization than the one the forward applied.
         grad_x: Optional preallocated [B, TOPK, DIM] bf16 output.
+        expert_ids: Optional ``[B, TOPK]`` route IDs. Negative routes receive
+            zero gradients.
 
     Returns:
         (grad_x, grad_weights) where grad_x is [B, TOPK, DIM] bf16
         and grad_weights is [B, TOPK] f32.
     """
     B, TOPK, DIM = x.shape
+    if expert_ids is not None and (
+        expert_ids.shape != (B, TOPK)
+        or expert_ids.dtype not in (torch.int32, torch.int64)
+        or expert_ids.device != x.device
+        or not expert_ids.is_contiguous()
+    ):
+        raise ValueError(
+            "expert_ids must be contiguous int32/int64 with shape [B, TOPK]"
+        )
     if grad_x is not None and (
         grad_x.shape != x.shape
         or grad_x.dtype != x.dtype
@@ -483,6 +547,7 @@ def _fused_rmsnorm_combine_bwd(
             dy=fallback_grad_y,
             scale=weights,
             x=x_norm.reshape(B, TOPK, DIM),
+            expert_ids=expert_ids,
         )
         grad_x_out, _ = cute_rmsnorm_bwd(
             dy=grad_x_norm.reshape(B * TOPK, DIM),
@@ -502,6 +567,7 @@ def _fused_rmsnorm_combine_bwd(
             output_dtype=x.dtype,
             require_bitwise=require_bitwise,
             use_kahan=use_kahan,
+            expert_ids=expert_ids,
         )
 
     dtype = torch2cute_dtype_map[x.dtype]
@@ -532,6 +598,7 @@ def _fused_rmsnorm_combine_bwd(
         grad_y = grad_y.clone(memory_format=torch.contiguous_format)
     w_flat = weights.reshape(B * TOPK)
     rstd_flat = rstd.reshape(B * TOPK)
+    expert_ids_flat = None if expert_ids is None else expert_ids.reshape(B * TOPK)
 
     grad_w = torch.empty(B * TOPK, dtype=torch.float32, device=x.device)
 
@@ -544,6 +611,8 @@ def _fused_rmsnorm_combine_bwd(
             DIM,
             TOPK,
             use_exact_kernel,
+            (None if expert_ids is None else torch2cute_dtype_map[expert_ids.dtype]),
+            expert_ids is not None,
         )(
             grad_y,
             x_2d,
@@ -551,6 +620,7 @@ def _fused_rmsnorm_combine_bwd(
             rstd_flat,
             grad_x_out,
             grad_w,
+            expert_ids_flat,
         )
 
     if requested_grad_x is not None and grad_x_out is not requested_grad_x:

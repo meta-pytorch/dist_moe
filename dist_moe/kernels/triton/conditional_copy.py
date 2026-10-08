@@ -51,6 +51,8 @@ from .._environment import num_sms_per_device
 from ..activation_buffer import (
     validate_conditional_execution,
 )
+from .comm_utils import get_flat_tid
+from .device_trap import device_trap_if
 
 _COPY_BLOCK_SIZE = 1024
 _COPY_CTAS_PER_SM = 32
@@ -124,6 +126,31 @@ def _validate_routing_publication(
         raise ValueError("routing publication tensors must be on the input device")
 
 
+def copy_routing(
+    *,
+    expert_ids: torch.Tensor,
+    routing: torch.Tensor,
+    routing_token_count_1: torch.Tensor,
+    num_experts: int,
+    validate_expert_ids: bool,
+) -> None:
+    """Publish inference routing metadata with native stream semantics."""
+    _validate_routing_publication(
+        expert_ids=expert_ids,
+        routing=routing,
+        routing_token_count_1=routing_token_count_1,
+        device=expert_ids.device,
+    )
+    if validate_expert_ids:
+        valid = (expert_ids >= -1) & (expert_ids < num_experts)
+        torch._assert_async(
+            torch.all(valid),
+            "DistMoE expert ID is outside [-1, num_experts)",
+        )
+    routing.copy_(expert_ids)
+    routing_token_count_1.fill_(expert_ids.shape[0])
+
+
 def copy_routing_and_dispatch(
     *,
     x: torch.Tensor,
@@ -131,6 +158,8 @@ def copy_routing_and_dispatch(
     expert_ids: torch.Tensor,
     routing: torch.Tensor,
     routing_token_count_1: torch.Tensor,
+    num_experts: int,
+    validate_expert_ids: bool,
 ) -> None:
     """Publish actual T, routing IDs, and dense dispatch input in one launch."""
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -169,6 +198,31 @@ def copy_routing_and_dispatch(
         routing_stride_0=expert_ids.stride(0),
         routing_stride_1=expert_ids.stride(1),
         BLOCK_SIZE=_COPY_BLOCK_SIZE,
+        num_warps=_COPY_NUM_WARPS,
+        num_stages=_COPY_NUM_STAGES,
+        NUM_EXPERTS=num_experts,
+        VALIDATE_EXPERT_IDS=validate_expert_ids,
+    )
+
+
+def zero_out_padded_rows_(
+    values_MD: torch.Tensor,
+    expert_ids_TK: torch.Tensor,
+) -> None:
+    """Zero route rows whose corresponding expert ID is negative in place."""
+    if values_MD.ndim != 2 or not values_MD.is_contiguous():
+        raise ValueError("values_MD must be a contiguous two-dimensional tensor")
+    if expert_ids_TK.dtype not in (torch.int32, torch.int64):
+        raise TypeError("expert_ids_TK must use int32 or int64")
+    if not expert_ids_TK.is_contiguous() or expert_ids_TK.device != values_MD.device:
+        raise ValueError("expert_ids_TK must be contiguous on the values device")
+    if values_MD.shape[0] != expert_ids_TK.numel():
+        raise ValueError("values_MD rows must match the flattened expert-ID count")
+    _triton_zero_out_padded_rows[(values_MD.shape[0],)](
+        values_MD,
+        expert_ids_TK,
+        values_MD.shape[1],
+        BLOCK_D=1024,
         num_warps=_COPY_NUM_WARPS,
         num_stages=_COPY_NUM_STAGES,
     )
@@ -252,6 +306,8 @@ def _triton_copy_routing_and_dispatch(
     routing_num_cols,
     routing_stride_0,
     routing_stride_1,
+    NUM_EXPERTS: tl.constexpr,
+    VALIDATE_EXPERT_IDS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # int64: pid * BLOCK_SIZE wraps int32 once the published payload exceeds 2**31 elements.
@@ -269,12 +325,38 @@ def _triton_copy_routing_and_dispatch(
     routing_cols = offsets - routing_rows * routing_num_cols
     routing_offsets = routing_rows * routing_stride_0 + routing_cols * routing_stride_1
     expert_ids = tl.load(expert_ids_ptr + routing_offsets, mask=routing_mask)
+    if VALIDATE_EXPERT_IDS:
+        invalid = routing_mask & ((expert_ids < -1) | (expert_ids >= NUM_EXPERTS))
+        has_invalid = tl.sum(invalid.to(tl.int32)) > 0
+        should_trap = has_invalid & (get_flat_tid() == 0)
+        if should_trap:
+            tl.device_print("DistMoE expert ID is outside [-1, num_experts)")
+        device_trap_if(should_trap)
     tl.store(routing_ptr + offsets, expert_ids, mask=routing_mask)
     tl.store(
         routing_token_count_ptr + offsets,
         routing_num_rows,
         mask=offsets == 0,
     )
+
+
+@triton.jit
+def _triton_zero_out_padded_rows(
+    values_ptr,
+    expert_ids_ptr,
+    feature_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    route = tl.program_id(0).to(tl.int64)
+    if tl.load(expert_ids_ptr + route) < 0:
+        offsets = tl.arange(0, BLOCK_D)
+        for start_d in tl.range(0, feature_dim, BLOCK_D):
+            cols = start_d + offsets
+            tl.store(
+                values_ptr + route * feature_dim + cols,
+                0.0,
+                mask=cols < feature_dim,
+            )
 
 
 def conditional_copy_activations(

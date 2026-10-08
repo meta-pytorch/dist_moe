@@ -170,6 +170,11 @@ rows per local expert and produce:
 These tensors live in ordinary local HBM or context-owned routing workspace.
 The operation never transfers route counts to the CPU.
 
+Expert ID `-1` marks an inactive route. Routing does not produce a pointer or
+expert row for that slot, and the later score/reduction kernels mask its
+unwritten combine storage at load time. An all-`-1` token therefore remains in
+the physical `[T, D]` output as an exact zero row.
+
 For rank 0, the resulting expert-major pointer order is `E0[A,C], E1[B,D]`.
 Pointers for `A` and `B` address rank 0's dispatch buffer; pointers for `C` and
 `D` address rank 1's buffer.

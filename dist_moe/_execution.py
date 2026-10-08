@@ -129,6 +129,14 @@ class ExecutionOptions:
             accumulate into its existing contents. The callback owns and
             exposes that mutated destination, so WGRAD is not returned to
             autograd.
+        validate_expert_ids: Whether routing publication checks every expert ID
+            is in ``[-1, num_experts)`` before routing. Training folds the check
+            into fused publication; inference performs an opt-in device check
+            before native publication. Violations device-trap.
+        zero_out_padded_callback_inputs: Whether invalid route rows are zeroed
+            before Python postprocess and observer callbacks. This is required
+            when callbacks coexist with ``-1`` routes unless the caller
+            otherwise guarantees callback-safe storage.
     """
 
     inplace_wgrad_accum: bool = False
@@ -143,6 +151,8 @@ class ExecutionOptions:
     swiglu_clip_stats_out_3: torch.Tensor | None = None
     swiglu_clip_limit: float = 7.0
     wgrad_destination_fn: WgradDestinationFn | None = None
+    validate_expert_ids: bool = False
+    zero_out_padded_callback_inputs: bool = False
 
     def __post_init__(self) -> None:
         """Validate graph-visible observability and WGRAD controls.
@@ -155,6 +165,9 @@ class ExecutionOptions:
         """
         self._validate_clip_observability()
         self._validate_wgrad_ownership()
+        for name in ("validate_expert_ids", "zero_out_padded_callback_inputs"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
 
     def _validate_clip_observability(self) -> None:
         """Validate the optional graph-visible SwiGLU clip counters."""

@@ -223,8 +223,9 @@ number of experts owned by this rank. The global expert count is
 The W13 weight may have shape `[E_local, 2, F, D]` or `[E_local, 2F, D]`.
 The flattened form `[E_local * 2F, D]` is also accepted
 when W2 is `[E_local * D, F]`. Inputs and weights must be contiguous CUDA BF16
-tensors. Expert IDs must be contiguous integers in `[0, num_experts)`; scores
-must be contiguous BF16 or FP32 tensors.
+tensors. Expert IDs must be contiguous integers in `[-1, num_experts)`, where
+`-1` disables a route and requires score zero. Scores must be contiguous BF16
+or FP32 tensors.
 
 <a id="understand-the-execution-model"></a>
 ## Understand the execution model
@@ -269,6 +270,16 @@ counts. Every expert-parallel rank must use the same `T` for one invocation;
 unequal counts trigger a device-side trap before routing metadata is generated.
 That failure terminates the distributed iteration and invalidates the CUDA
 execution context; it is not a recoverable Python input error.
+
+Padding remains part of the physical `T` rows. Set an inactive route's expert
+ID to `-1` and its score to zero. Dist-MoE excludes that route from routing,
+communication, scratch demand, expert computation, output, and gradients. A
+row whose `K` IDs are all `-1` therefore produces an exact zero row while the
+returned tensor remains `[T, D]`; mixed valid and inactive routes are allowed.
+Values outside `[-1, num_experts)` violate the caller contract. For integration
+debugging, `ExecutionOptions(validate_expert_ids=True)` checks that range in
+fused training publication or before native inference publication, and
+device-traps on failure.
 
 <a id="choose-a-precision-and-pipeline"></a>
 ## Choose a precision and pipeline
@@ -596,6 +607,13 @@ options = dist_moe.ExecutionOptions(
 Callback-free typed policies use the registered graph path. Arbitrary Python
 callbacks and observers use the eager extension path. See
 [post-expert processing](docs/postprocess.md).
+
+Callback-free reduction and typed RMSNorm mask `-1` routes inside kernels they
+already launch. A Python callback normally receives valid expert rows plus
+unspecified storage for inactive rows. Set
+`zero_out_padded_callback_inputs=True` to zero inactive rows before callback or
+observer code; this opt-in policy may add one eager-only bandwidth launch when
+the zeroing cannot be fused with an existing save/copy.
 
 ### Clamped SwiGLU
 

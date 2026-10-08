@@ -282,6 +282,11 @@ SwiGLU and W2 and scatters each route result back to its source rank.
 | 4 | `dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine()` | BF16 `h1` and prepared W2 in local HBM | BF16 route outputs in peer combine HBM plus W2 column input | local activation buffer and peer symmetric HBM; `h1`/column W2 follow the same planner decision | remote stores complete before the combine barrier |
 | 5 | `scale_and_sum()` | local combine rows and router scores | BF16 `output_TD` | ordinary local HBM; only fixed routing/planner state reaches autograd | consumes combine rows after the EP barrier |
 
+Expert ID `-1` is inactive in both staged and Mega execution. It creates no
+received or padded expert row, and common postprocessing masks its unwritten
+combine slot. Fully padded tokens therefore return exact zero rows without
+consuming quantized expert capacity.
+
 ### W13 dispatch
 
 `dist_blockscaled_grouped_gemm_fprop_dispatch()` gathers BF16 route rows from
