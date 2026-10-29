@@ -277,6 +277,9 @@ def _combine_swiglu_fwd_quantize_subtile(  # noqa: C901
         params.combine_swiglu_clamped,
         params.combine_swiglu_alpha,
         params.combine_swiglu_limit,
+        params.combine_situ_glu,
+        params.combine_situ_glu_gate_beta,
+        params.combine_situ_glu_up_beta,
         do_fwd_row_quant,
     )
     if cutlass.const_expr(mValidPtrs is not None):
@@ -450,6 +453,9 @@ def _combine_swiglu_bwd_quantize_tile(  # noqa: C901
         params.combine_swiglu_clamped,
         params.combine_swiglu_alpha,
         params.combine_swiglu_limit,
+        params.combine_situ_glu,
+        params.combine_situ_glu_gate_beta,
+        params.combine_situ_glu_up_beta,
         False,
     )
     if cutlass.const_expr(mValidPtrs is not None):

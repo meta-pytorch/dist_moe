@@ -17,9 +17,12 @@ from cutlass.cute.nvgpu import cpasync
 from ..formats import (
     BlockScaledFormat,
     BlockScaledFormatId,
+    canonical_situ_glu,
     canonical_swiglu_clamp,
     CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM,
     resolve_half_range_scale,
+    SITU_GLU_GATE_BETA_DEFAULT,
+    SITU_GLU_UP_BETA_DEFAULT,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
@@ -269,6 +272,9 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
         combine_swiglu_clamped: bool = False,
         combine_swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
         combine_swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+        combine_situ_glu: bool = False,
+        combine_situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+        combine_situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
         combine_swiglu_row_quant_only: bool = False,
         combine_precomputed_swiglu: bool = False,
         combine_swiglu_k: int | None = None,
@@ -325,6 +331,17 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
         ) = canonical_swiglu_clamp(
             combine_swiglu_clamped, combine_swiglu_alpha, combine_swiglu_limit
         )
+        (
+            self.combine_situ_glu,
+            self.combine_situ_glu_gate_beta,
+            self.combine_situ_glu_up_beta,
+        ) = canonical_situ_glu(
+            combine_situ_glu,
+            combine_situ_glu_gate_beta,
+            combine_situ_glu_up_beta,
+        )
+        if self.combine_swiglu_clamped and self.combine_situ_glu:
+            raise ValueError("clamped SwiGLU and SiTU-GLU are mutually exclusive")
         self.combine_swiglu_row_quant_only = combine_swiglu_row_quant_only
         self.combine_precomputed_swiglu = combine_precomputed_swiglu
         self.combine_swiglu_k = combine_swiglu_k
@@ -401,6 +418,16 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
             ),
             combine_swiglu_limit=float(
                 config.get("COMBINE_SWIGLU_LIMIT", SWIGLU_CLAMP_LIMIT_DEFAULT)
+            ),
+            combine_situ_glu=bool(config.get("COMBINE_SITU_GLU", False)),
+            combine_situ_glu_gate_beta=float(
+                config.get("COMBINE_SITU_GLU_GATE_BETA", SITU_GLU_GATE_BETA_DEFAULT)
+            ),
+            combine_situ_glu_up_beta=float(
+                config.get(
+                    "COMBINE_SITU_GLU_UP_BETA",
+                    SITU_GLU_UP_BETA_DEFAULT,
+                )
             ),
             combine_swiglu_row_quant_only=bool(
                 config.get("COMBINE_SWIGLU_ROW_QUANT_ONLY", False)
@@ -504,6 +531,9 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
             clamped=self.combine_swiglu_clamped,
             alpha=self.combine_swiglu_alpha,
             limit=self.combine_swiglu_limit,
+            situ_glu=self.combine_situ_glu,
+            situ_glu_gate_beta=self.combine_situ_glu_gate_beta,
+            situ_glu_up_beta=self.combine_situ_glu_up_beta,
             swap_ab=self.SWAP_AB,
             format_id=self.format_id,
             qdata_elems_per_word=self.DISPATCH_QUANT_QDATA_ELEMS_PER_WORD,
@@ -920,6 +950,9 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
                             self.combine_swiglu_clamped,
                             self.combine_swiglu_alpha,
                             self.combine_swiglu_limit,
+                            self.combine_situ_glu,
+                            self.combine_situ_glu_gate_beta,
+                            self.combine_situ_glu_up_beta,
                         )
                     block_amaxes[block_rep] = _compute_row_amax_b16x2_x16(
                         packed,

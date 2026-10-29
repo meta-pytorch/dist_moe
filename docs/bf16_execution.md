@@ -250,17 +250,17 @@ context values used identically in forward, backward, and conditional forward
 recomputation.
 
 With `dist_moe.Config(activation="situ_glu")`, the kernel evaluates bounded
-SiTU-GLU as `(situ_glu_beta * tanh(g / situ_glu_beta) * sigmoid(g)) *
-(situ_glu_linear_beta * tanh(u / situ_glu_linear_beta))`. `situ_glu_beta` and
-`situ_glu_linear_beta` are static context values used identically in forward,
-backward, and conditional forward recomputation. This variant is currently
-available only for BF16 execution and retains the standalone forward and
-backward activation kernels; native fused SwiGLU epilogues do not implement
-SiTU-GLU. The shared launchers use the dedicated
+SiTU-GLU as `(situ_glu_gate_beta * tanh(g / situ_glu_gate_beta) * sigmoid(g)) *
+(situ_glu_up_beta * tanh(u / situ_glu_up_beta))`. `situ_glu_gate_beta` and
+`situ_glu_up_beta` are static context values used identically in forward,
+backward, and conditional forward recomputation. BF16 retains the standalone
+forward and backward activation kernels; native fused SwiGLU epilogues do not
+implement SiTU-GLU. The shared launchers use the dedicated
 [`situ_glu.py`](../dist_moe/kernels/triton/situ_glu.py) arithmetic helpers
 without changing tiling, pointer chasing, or gradient-store order.
+For MXFP8 support, see [MXFP8 execution](mxfp8_execution.md).
 
-Both tanhs use precise CUDA math. For `situ_glu_beta=4.0`, forward and backward
+Both tanhs use precise CUDA math. For `situ_glu_gate_beta=4.0`, forward and backward
 reuse `t = tanh(g / 4)` via `sigmoid(g) = 0.5 + t / (1 + t * t)` instead of
 evaluating a separate exponential. This identity is exact in real arithmetic,
 not bitwise identical to an independent FP32 sigmoid. Other positive bounds

@@ -38,8 +38,8 @@ class SwigluBenchmarkTest(unittest.TestCase):
                 self.assertEqual(config.num_activation_slots, 1)
                 self.assertEqual(config.wgrad_dtype, torch.bfloat16)
                 self.assertIsNone(config.vmm)
-                self.assertEqual(config.situ_glu_beta, 4.0)
-                self.assertEqual(config.situ_glu_linear_beta, 25.0)
+                self.assertEqual(config.situ_glu_gate_beta, 4.0)
+                self.assertEqual(config.situ_glu_up_beta, 25.0)
 
     def test_gradient_snapshots_are_independent(self) -> None:
         """CPU snapshots preserve exact values without aliasing live gradients."""
@@ -66,3 +66,14 @@ class SwigluBenchmarkTest(unittest.TestCase):
                     RuntimeError, rf"{name}\.grad \(input {missing_index}\)"
                 ):
                     snapshot_gradients(inputs)
+
+    def test_fast_math_is_explicit_and_mxfp8_only(self) -> None:
+        """Do not silently change BF16 precision to match a fused backend."""
+        with self.assertRaises(SystemExit):
+            parse_args(["--fast-math", "--pipeline", "bf16"])
+        for pipeline in ("staged", "mega"):
+            args = parse_args(["--pipeline", pipeline, "--fast-math"])
+            for activation in ACTIVATIONS:
+                config = make_config(args, activation)
+                self.assertEqual(config.block_scaled.pipeline, pipeline)
+                self.assertTrue(config.block_scaled.fast_math)

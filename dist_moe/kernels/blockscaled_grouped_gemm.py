@@ -36,6 +36,7 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 from ..formats import (
+    canonical_situ_glu,
     canonical_swiglu_clamp,
     CUBLAS_BLOCKED_ROWS_PER_ATOM,
     CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM,
@@ -154,6 +155,31 @@ def _set_swiglu_clamp_config(
         cfg["COMBINE_SWIGLU_CLAMPED"] = True
         cfg["COMBINE_SWIGLU_ALPHA"] = alpha
         cfg["COMBINE_SWIGLU_LIMIT"] = limit
+
+
+def _set_situ_glu_config(
+    cfg: dict,
+    situ_glu: bool,
+    situ_glu_gate_beta: float,
+    situ_glu_up_beta: float,
+) -> None:
+    """Write the SiTU-GLU specialization into ``cfg`` when selected.
+
+    Args:
+        cfg: Mutable kernel configuration.
+        situ_glu: Whether bounded SiTU-GLU is selected.
+        situ_glu_gate_beta: Gate tanh bound.
+        situ_glu_up_beta: Up-projection tanh bound.
+    """
+    situ_glu, situ_glu_gate_beta, situ_glu_up_beta = canonical_situ_glu(
+        situ_glu,
+        situ_glu_gate_beta,
+        situ_glu_up_beta,
+    )
+    if situ_glu:
+        cfg["COMBINE_SITU_GLU"] = True
+        cfg["COMBINE_SITU_GLU_GATE_BETA"] = situ_glu_gate_beta
+        cfg["COMBINE_SITU_GLU_UP_BETA"] = situ_glu_up_beta
 
 
 def _get_kernel(

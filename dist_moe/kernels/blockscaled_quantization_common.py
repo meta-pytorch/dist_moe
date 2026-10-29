@@ -42,6 +42,8 @@ from ..formats import (
     FP8_E5M2_MAX,
     NVFP4_MAX,
     NVFP4_TOKEN_AMAX_FLOOR,
+    SITU_GLU_GATE_BETA_DEFAULT,
+    SITU_GLU_UP_BETA_DEFAULT,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
@@ -928,6 +930,65 @@ def _swiglu_clamped_bwd_f32(
 
 
 @cute.jit
+def _situ_glu_sigmoid_f32(
+    x: Float32,
+    tanh_gate: Float32,
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    fast_math: cutlass.Constexpr[bool],
+) -> Float32:
+    """Evaluate sigmoid from the precise gate tanh when the gate bound is four."""
+    if cutlass.const_expr(situ_glu_gate_beta == 4.0):
+        return Float32(0.5) + tanh_gate / (Float32(_FP32_ONE) + tanh_gate * tanh_gate)
+    return _sigmoid_f32(x, fast_math)
+
+
+@cute.jit
+def _situ_glu_fwd_f32(
+    x: Float32,
+    y: Float32,
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
+    fast_math: cutlass.Constexpr[bool],
+) -> Float32:
+    """Bounded SiTU-GLU forward in FP32."""
+    tanh_gate = cute_math.tanh(x / Float32(situ_glu_gate_beta), fastmath=False)
+    bounded_gate = Float32(situ_glu_gate_beta) * tanh_gate
+    gate = bounded_gate * _situ_glu_sigmoid_f32(
+        x, tanh_gate, situ_glu_gate_beta, fast_math
+    )
+    tanh_up = cute_math.tanh(y / Float32(situ_glu_up_beta), fastmath=False)
+    bounded_up = Float32(situ_glu_up_beta) * tanh_up
+    return gate * bounded_up
+
+
+@cute.jit
+def _situ_glu_bwd_f32(
+    dz: Float32,
+    x: Float32,
+    y: Float32,
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
+    fast_math: cutlass.Constexpr[bool],
+):
+    """Bounded SiTU-GLU backward; return ``(dx, dy, h2)`` in FP32."""
+    tanh_gate = cute_math.tanh(x / Float32(situ_glu_gate_beta), fastmath=False)
+    bounded_gate = Float32(situ_glu_gate_beta) * tanh_gate
+    sigmoid_x = _situ_glu_sigmoid_f32(x, tanh_gate, situ_glu_gate_beta, fast_math)
+    gate = bounded_gate * sigmoid_x
+    tanh_up = cute_math.tanh(y / Float32(situ_glu_up_beta), fastmath=False)
+    bounded_up = Float32(situ_glu_up_beta) * tanh_up
+
+    d_bounded_gate = Float32(_FP32_ONE) - tanh_gate * tanh_gate
+    d_gate = d_bounded_gate * sigmoid_x + bounded_gate * sigmoid_x * (
+        Float32(_FP32_ONE) - sigmoid_x
+    )
+    dx = dz * bounded_up * d_gate
+    d_bounded_up = Float32(_FP32_ONE) - tanh_up * tanh_up
+    dy = dz * gate * d_bounded_up
+    return dx, dy, gate * bounded_up
+
+
+@cute.jit
 def _apply_block_scaled_quant_producer(
     primary: Float32,
     producer_b: Float32,
@@ -936,12 +997,23 @@ def _apply_block_scaled_quant_producer(
     clamped: cutlass.Constexpr[bool] = False,
     alpha: cutlass.Constexpr[float] = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: cutlass.Constexpr[float] = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: cutlass.Constexpr[bool] = False,
+    situ_glu_gate_beta: cutlass.Constexpr[float] = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: cutlass.Constexpr[float] = SITU_GLU_UP_BETA_DEFAULT,
 ) -> Float32:
     if cutlass.const_expr(producer_id == BLOCK_SCALED_PRODUCER_IDENTITY):
         return primary
     if cutlass.const_expr(producer_id == BLOCK_SCALED_PRODUCER_SWIGLU_FWD):
         if cutlass.const_expr(clamped):
             return _swiglu_clamped_fwd_f32(primary, producer_b, alpha, limit, fast_math)
+        if cutlass.const_expr(situ_glu):
+            return _situ_glu_fwd_f32(
+                primary,
+                producer_b,
+                situ_glu_gate_beta,
+                situ_glu_up_beta,
+                fast_math,
+            )
         return primary * _sigmoid_f32(primary, fast_math) * producer_b
     return primary
 
@@ -969,9 +1041,22 @@ def _apply_block_scaled_quant_dxy_producer(
     clamped: cutlass.Constexpr[bool] = False,
     alpha: cutlass.Constexpr[float] = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: cutlass.Constexpr[float] = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: cutlass.Constexpr[bool] = False,
+    situ_glu_gate_beta: cutlass.Constexpr[float] = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: cutlass.Constexpr[float] = SITU_GLU_UP_BETA_DEFAULT,
 ):
     if cutlass.const_expr(clamped):
         dx, dy, _ = _swiglu_clamped_bwd_f32(dz, x, y, alpha, limit, fast_math)
+        return dx, dy
+    if cutlass.const_expr(situ_glu):
+        dx, dy, _ = _situ_glu_bwd_f32(
+            dz,
+            x,
+            y,
+            situ_glu_gate_beta,
+            situ_glu_up_beta,
+            fast_math,
+        )
         return dx, dy
     dx, dy, _ = _apply_block_scaled_quant_dxy_values(dz, x, y, fast_math)
     return dx, dy
@@ -986,9 +1071,21 @@ def _apply_block_scaled_quant_dxy_fwd_producer(
     clamped: cutlass.Constexpr[bool] = False,
     alpha: cutlass.Constexpr[float] = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: cutlass.Constexpr[float] = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: cutlass.Constexpr[bool] = False,
+    situ_glu_gate_beta: cutlass.Constexpr[float] = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: cutlass.Constexpr[float] = SITU_GLU_UP_BETA_DEFAULT,
 ):
     if cutlass.const_expr(clamped):
         return _swiglu_clamped_bwd_f32(dz, x, y, alpha, limit, fast_math)
+    if cutlass.const_expr(situ_glu):
+        return _situ_glu_bwd_f32(
+            dz,
+            x,
+            y,
+            situ_glu_gate_beta,
+            situ_glu_up_beta,
+            fast_math,
+        )
     dx, dy, x_sigmoid = _apply_block_scaled_quant_dxy_values(dz, x, y, fast_math)
     return dx, dy, x_sigmoid * y
 
@@ -1032,6 +1129,35 @@ def _swiglu_clamped_bwd_f32x2(
     dy1 = Float32(_FP32_ZERO) if y_f32x2[1] > Float32(limit) else dy_f32x2[1]
     dy1 = Float32(_FP32_ZERO) if y_f32x2[1] < Float32(-limit) else dy1
     return (dx0, dx1), (dy0, dy1), h2_f32x2
+
+
+@cute.jit
+def _situ_glu_bwd_f32x2(
+    dz_f32x2,
+    x_f32x2,
+    y_f32x2,
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
+    fast_math: cutlass.Constexpr[bool],
+):
+    """Two-lane bounded SiTU-GLU backward with scalar transcendental math."""
+    dx0, dy0, h20 = _situ_glu_bwd_f32(
+        dz_f32x2[0],
+        x_f32x2[0],
+        y_f32x2[0],
+        situ_glu_gate_beta,
+        situ_glu_up_beta,
+        fast_math,
+    )
+    dx1, dy1, h21 = _situ_glu_bwd_f32(
+        dz_f32x2[1],
+        x_f32x2[1],
+        y_f32x2[1],
+        situ_glu_gate_beta,
+        situ_glu_up_beta,
+        fast_math,
+    )
+    return (dx0, dx1), (dy0, dy1), (h20, h21)
 
 
 @cute.jit
@@ -1096,10 +1222,22 @@ def _apply_block_scaled_quant_dxy_fwd_producer_f32x2(
     clamped: cutlass.Constexpr[bool] = False,
     alpha: cutlass.Constexpr[float] = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: cutlass.Constexpr[float] = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: cutlass.Constexpr[bool] = False,
+    situ_glu_gate_beta: cutlass.Constexpr[float] = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: cutlass.Constexpr[float] = SITU_GLU_UP_BETA_DEFAULT,
 ):
     if cutlass.const_expr(clamped):
         return _swiglu_clamped_bwd_f32x2(
             dz_f32x2, x_f32x2, y_f32x2, alpha, limit, fast_math
+        )
+    if cutlass.const_expr(situ_glu):
+        return _situ_glu_bwd_f32x2(
+            dz_f32x2,
+            x_f32x2,
+            y_f32x2,
+            situ_glu_gate_beta,
+            situ_glu_up_beta,
+            fast_math,
         )
     dx_f32x2, dy_f32x2, x_sigmoid_f32x2 = _apply_block_scaled_quant_dxy_values_f32x2(
         dz_f32x2,
@@ -1120,10 +1258,23 @@ def _apply_block_scaled_quant_dxy_producer_f32x2(
     clamped: cutlass.Constexpr[bool] = False,
     alpha: cutlass.Constexpr[float] = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: cutlass.Constexpr[float] = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: cutlass.Constexpr[bool] = False,
+    situ_glu_gate_beta: cutlass.Constexpr[float] = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: cutlass.Constexpr[float] = SITU_GLU_UP_BETA_DEFAULT,
 ):
     if cutlass.const_expr(clamped):
         dx_f32x2, dy_f32x2, _ = _swiglu_clamped_bwd_f32x2(
             dz_f32x2, x_f32x2, y_f32x2, alpha, limit, fast_math
+        )
+        return dx_f32x2, dy_f32x2
+    if cutlass.const_expr(situ_glu):
+        dx_f32x2, dy_f32x2, _ = _situ_glu_bwd_f32x2(
+            dz_f32x2,
+            x_f32x2,
+            y_f32x2,
+            situ_glu_gate_beta,
+            situ_glu_up_beta,
+            fast_math,
         )
         return dx_f32x2, dy_f32x2
     dx_f32x2, dy_f32x2, _ = _apply_block_scaled_quant_dxy_values_f32x2(

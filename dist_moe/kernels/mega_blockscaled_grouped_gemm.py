@@ -12,7 +12,10 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 from ..formats import (
+    canonical_situ_glu,
     canonical_swiglu_clamp,
+    SITU_GLU_GATE_BETA_DEFAULT,
+    SITU_GLU_UP_BETA_DEFAULT,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
@@ -42,6 +45,7 @@ from .blockscaled_grouped_gemm import (
     _make_pointer_stride_args,
     _parse_blockscaled_problem,
     _resolve_output_tensor,
+    _set_situ_glu_config,
     _set_swiglu_clamp_config,
     _torch_dtype,
     _torch_layout_signature,
@@ -978,11 +982,19 @@ def _get_mega_blockscaled_kernel(
     combine_swiglu_clamped: bool = False,
     combine_swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     combine_swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    combine_situ_glu: bool = False,
+    combine_situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    combine_situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     mode: int = MegaBlockScaledGroupedGemmKernel.MEGA_BACKWARD_DISPATCH_MODE,
     schedule_rotation: bool = True,
 ) -> MegaBlockScaledGroupedGemmKernel:
     swiglu_clamp = canonical_swiglu_clamp(
         combine_swiglu_clamped, combine_swiglu_alpha, combine_swiglu_limit
+    )
+    situ_glu_config = canonical_situ_glu(
+        combine_situ_glu,
+        combine_situ_glu_gate_beta,
+        combine_situ_glu_up_beta,
     )
     key = (
         _config_cache_key(config),
@@ -993,6 +1005,7 @@ def _get_mega_blockscaled_kernel(
         dispatch_source_dtype,
         combine_swiglu_fast_math,
         swiglu_clamp,
+        situ_glu_config,
         mode,
         schedule_rotation,
     )
@@ -1002,6 +1015,7 @@ def _get_mega_blockscaled_kernel(
         if combine_swiglu_fast_math:
             kernel_config["COMBINE_SWIGLU_FAST_MATH"] = True
         _set_swiglu_clamp_config(kernel_config, *swiglu_clamp)
+        _set_situ_glu_config(kernel_config, *situ_glu_config)
         inst = MegaBlockScaledGroupedGemmKernel.from_config(
             kernel_config,
             mode=mode,
@@ -1416,6 +1430,9 @@ def _cute_mega_blockscaled_grouped_gemm_combine_bprop(  # noqa: C901
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -1620,6 +1637,9 @@ def _cute_mega_blockscaled_grouped_gemm_combine_bprop(  # noqa: C901
         combine_swiglu_clamped=swiglu_clamped,
         combine_swiglu_alpha=swiglu_alpha,
         combine_swiglu_limit=swiglu_limit,
+        combine_situ_glu=situ_glu,
+        combine_situ_glu_gate_beta=situ_glu_gate_beta,
+        combine_situ_glu_up_beta=situ_glu_up_beta,
         schedule_rotation=not pre_shuffled_rows,
     )
     workspace = _allocate_mega_dispatch_counter_workspace(
@@ -1702,6 +1722,7 @@ def _cute_mega_blockscaled_grouped_gemm_combine_bprop(  # noqa: C901
         output_accum,
         swiglu_fast_math,
         canonical_swiglu_clamp(swiglu_clamped, swiglu_alpha, swiglu_limit),
+        canonical_situ_glu(situ_glu, situ_glu_gate_beta, situ_glu_up_beta),
         use_activation_buffer,
         use_conditional_execution,
         "mega_combine_bprop",
@@ -1751,6 +1772,9 @@ def mega_blockscaled_grouped_gemm_dgrad_wgrad_swiglu_bwd_combine(
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -1785,6 +1809,9 @@ def mega_blockscaled_grouped_gemm_dgrad_wgrad_swiglu_bwd_combine(
             swiglu_clamped=swiglu_clamped,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
+            situ_glu=situ_glu,
+            situ_glu_gate_beta=situ_glu_gate_beta,
+            situ_glu_up_beta=situ_glu_up_beta,
             activation_buffer=activation_buffer,
             activation_offsets=activation_offsets,
             conditional_execution=conditional_execution,

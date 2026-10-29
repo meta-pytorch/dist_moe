@@ -256,7 +256,10 @@ class BlockScaledConfig:
     Args:
         format: MXFP8 E4M3 training/inference or NVIDIA FP4 inference operands.
         fast_math: Whether MXFP8 fused SwiGLU uses approximate sigmoid math.
-            NVFP4 inference does not support this option.
+            SiTU-GLU tanhs remain precise. Its default gate bound of four
+            reuses that tanh for sigmoid regardless of this flag; other bounds
+            use an independent sigmoid controlled by the flag. NVFP4 inference
+            does not support this option.
         pipeline: ``"staged"`` for separate expert GEMMs or ``"mega"`` for
             the fused chunk-pipelined forward. MXFP8 Mega also fuses each
             DGRAD/WGRAD pair; NVFP4 remains forward-only.
@@ -373,16 +376,18 @@ class Config:
         activation: Gated activation. ``"swiglu_clamped"`` selects
             ``min(gate, limit) * sigmoid(alpha * min(gate, limit)) *
             (clamp(up, -limit, limit) + 1)``. ``"situ_glu"`` selects
-            ``situ_glu_beta * tanh(gate / situ_glu_beta) * sigmoid(gate) *
-            situ_glu_linear_beta * tanh(up / situ_glu_linear_beta)`` and is BF16-only.
+            ``situ_glu_gate_beta * tanh(gate / situ_glu_gate_beta) * sigmoid(gate) *
+            situ_glu_up_beta * tanh(up / situ_glu_up_beta)`` for BF16
+            or MXFP8 E4M3.
         swiglu_alpha: Sigmoid multiplier for clamped SwiGLU.
         swiglu_limit: Gate and up-projection bound for clamped SwiGLU.
-        situ_glu_beta: Gate tanh bound for SiTU-GLU. BF16 uses precise tanhs;
+        situ_glu_gate_beta: Gate tanh bound for SiTU-GLU. Both backends use precise tanhs;
             the default bound of four reuses the gate tanh to evaluate sigmoid
             in FP32, with normal rounding rather than bitwise sigmoid parity.
-            Other bounds use an independent precise sigmoid. Ignored by other
+            Other bounds use an independent sigmoid, precise in BF16 and
+            controlled by ``block_scaled.fast_math`` in MXFP8. Ignored by other
             activations and canonicalized at kernel launch.
-        situ_glu_linear_beta: Up-projection tanh bound for SiTU-GLU. Ignored by
+        situ_glu_up_beta: Up-projection tanh bound for SiTU-GLU. Ignored by
             other activations and canonicalized at kernel launch.
         wgrad_dtype: Optional explicit BF16 or FP32 weight-gradient output
             dtype. ``None`` uses each parameter's non-``None`` ``grad_dtype``
@@ -414,8 +419,8 @@ class Config:
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT
     wgrad_dtype: torch.dtype | None = None
     inference: bool = False
-    situ_glu_beta: float = SITU_GLU_GATE_BETA_DEFAULT
-    situ_glu_linear_beta: float = SITU_GLU_UP_BETA_DEFAULT
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT
 
     def __post_init__(self) -> None:  # noqa: C901
         """Validate static execution parameters.
@@ -524,16 +529,20 @@ class Config:
                 "clamped SwiGLU requires finite positive swiglu_alpha and swiglu_limit"
             )
         if self.activation == "situ_glu" and (
-            not math.isfinite(self.situ_glu_beta)
-            or not math.isfinite(self.situ_glu_linear_beta)
-            or self.situ_glu_beta <= 0
-            or self.situ_glu_linear_beta <= 0
+            not math.isfinite(self.situ_glu_gate_beta)
+            or not math.isfinite(self.situ_glu_up_beta)
+            or self.situ_glu_gate_beta <= 0
+            or self.situ_glu_up_beta <= 0
         ):
             raise ValueError(
-                "SiTU-GLU requires finite positive situ_glu_beta and situ_glu_linear_beta"
+                "SiTU-GLU requires finite positive situ_glu_gate_beta and situ_glu_up_beta"
             )
-        if self.activation == "situ_glu" and self.block_scaled is not None:
-            raise ValueError("SiTU-GLU currently supports BF16 execution only")
+        if (
+            self.activation == "situ_glu"
+            and self.block_scaled is not None
+            and self.block_scaled.format is not BlockScaledFormat.MXFP8_E4M3
+        ):
+            raise ValueError("block-scaled SiTU-GLU supports MXFP8 E4M3 only")
         if self.block_scaled is not None:
             _validate_block_scaled_config(self)
 
@@ -2128,8 +2137,8 @@ class _Bf16Autograd(torch.autograd.Function):
                     alpha=config.swiglu_alpha,
                     limit=config.swiglu_limit,
                     situ_glu=config.activation == "situ_glu",
-                    situ_glu_gate_beta=config.situ_glu_beta,
-                    situ_glu_up_beta=config.situ_glu_linear_beta,
+                    situ_glu_gate_beta=config.situ_glu_gate_beta,
+                    situ_glu_up_beta=config.situ_glu_up_beta,
                     activation_buffer=activation_buffer.buffer,
                     num_recv_tokens=num_recv_rows_1,
                     feature_dim=w2_EDF.shape[2],
@@ -2409,8 +2418,8 @@ class _Bf16Autograd(torch.autograd.Function):
                 alpha=config.swiglu_alpha,
                 limit=config.swiglu_limit,
                 situ_glu=config.activation == "situ_glu",
-                situ_glu_gate_beta=config.situ_glu_beta,
-                situ_glu_up_beta=config.situ_glu_linear_beta,
+                situ_glu_gate_beta=config.situ_glu_gate_beta,
+                situ_glu_up_beta=config.situ_glu_up_beta,
                 activation_buffer=activation_buffer.buffer,
                 num_recv_tokens=num_recv_rows_1,
                 feature_dim=w2_EDF.shape[2],
@@ -2553,8 +2562,8 @@ class _Bf16Autograd(torch.autograd.Function):
                     alpha=config.swiglu_alpha,
                     limit=config.swiglu_limit,
                     situ_glu=config.activation == "situ_glu",
-                    situ_glu_gate_beta=config.situ_glu_beta,
-                    situ_glu_up_beta=config.situ_glu_linear_beta,
+                    situ_glu_gate_beta=config.situ_glu_gate_beta,
+                    situ_glu_up_beta=config.situ_glu_up_beta,
                     activation_buffer=activation_buffer.buffer,
                     num_recv_tokens=num_recv_rows_1,
                     feature_dim=w2_EDF.shape[2],

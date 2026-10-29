@@ -24,6 +24,8 @@ from ._buffers import SymmetricMemoryBuffer
 from .formats import (
     BlockScaledFormat,
     ScaleFactorLayout,
+    SITU_GLU_GATE_BETA_DEFAULT,
+    SITU_GLU_UP_BETA_DEFAULT,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
@@ -466,6 +468,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -513,6 +518,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(
         swiglu_clamped: Whether to use clamped SwiGLU.
         swiglu_alpha: Clamped-SwiGLU alpha.
         swiglu_limit: Clamped-SwiGLU input limit.
+        situ_glu: Whether to use bounded SiTU-GLU.
+        situ_glu_gate_beta: Gate tanh bound for SiTU-GLU.
+        situ_glu_up_beta: Up-projection tanh bound for SiTU-GLU.
         activation_buffer: Optional activation buffer.
         activation_offsets: Optional device-side activation-buffer offsets.
         conditional_execution: Optional device recompute predicate.
@@ -551,6 +559,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(
         swiglu_clamped=swiglu_clamped,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
+        situ_glu=situ_glu,
+        situ_glu_gate_beta=situ_glu_gate_beta,
+        situ_glu_up_beta=situ_glu_up_beta,
         activation_buffer=activation_buffer,
         activation_offsets=activation_offsets,
         conditional_execution=conditional_execution,
@@ -588,6 +599,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     return_x_wgrad_quant: bool = False,
     blockscaled_dispatch: bool = False,
     return_h2_wgrad_quant: bool = True,
@@ -637,6 +651,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
         swiglu_clamped: Whether to use clamped SwiGLU.
         swiglu_alpha: Clamped-SwiGLU alpha.
         swiglu_limit: Clamped-SwiGLU input limit.
+        situ_glu: Whether to use bounded SiTU-GLU.
+        situ_glu_gate_beta: Gate tanh bound for SiTU-GLU.
+        situ_glu_up_beta: Up-projection tanh bound for SiTU-GLU.
         return_x_wgrad_quant: Whether to return column-oriented dispatched X.
         blockscaled_dispatch: Whether dispatch input is already quantized.
         return_h2_wgrad_quant: Whether to return column-oriented H2.
@@ -720,6 +737,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
         swiglu_clamped=swiglu_clamped,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
+        situ_glu=situ_glu,
+        situ_glu_gate_beta=situ_glu_gate_beta,
+        situ_glu_up_beta=situ_glu_up_beta,
         chunk_rows=chunk_rows,
         return_x_wgrad_quant=return_x_wgrad_quant,
         blockscaled_dispatch=blockscaled_dispatch,
@@ -763,6 +783,9 @@ def dist_blockscaled_grouped_gemm_dgrad_swiglu_bwd_combine(
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -792,6 +815,9 @@ def dist_blockscaled_grouped_gemm_dgrad_swiglu_bwd_combine(
         swiglu_clamped: Whether to use clamped SwiGLU.
         swiglu_alpha: Clamped-SwiGLU alpha.
         swiglu_limit: Clamped-SwiGLU input limit.
+        situ_glu: Whether to use bounded SiTU-GLU.
+        situ_glu_gate_beta: Gate tanh bound for SiTU-GLU.
+        situ_glu_up_beta: Up-projection tanh bound for SiTU-GLU.
         activation_buffer: Optional activation buffer.
         activation_offsets: Optional device-side activation-buffer offsets.
         conditional_execution: Optional device recompute predicate.
@@ -822,6 +848,9 @@ def dist_blockscaled_grouped_gemm_dgrad_swiglu_bwd_combine(
         swiglu_clamped=swiglu_clamped,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
+        situ_glu=situ_glu,
+        situ_glu_gate_beta=situ_glu_gate_beta,
+        situ_glu_up_beta=situ_glu_up_beta,
         activation_buffer=activation_buffer,
         activation_offsets=activation_offsets,
         conditional_execution=conditional_execution,
@@ -856,6 +885,9 @@ def dist_blockscaled_grouped_gemm_dgrad_wgrad_swiglu_bwd_combine(
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -888,6 +920,9 @@ def dist_blockscaled_grouped_gemm_dgrad_wgrad_swiglu_bwd_combine(
         swiglu_clamped: Whether to use clamped SwiGLU.
         swiglu_alpha: Clamped-SwiGLU alpha.
         swiglu_limit: Clamped-SwiGLU input limit.
+        situ_glu: Whether to use bounded SiTU-GLU.
+        situ_glu_gate_beta: Gate tanh bound for SiTU-GLU.
+        situ_glu_up_beta: Up-projection tanh bound for SiTU-GLU.
         activation_buffer: Optional activation buffer.
         activation_offsets: Optional device-side activation-buffer offsets.
         conditional_execution: Optional device recompute predicate.
@@ -926,6 +961,9 @@ def dist_blockscaled_grouped_gemm_dgrad_wgrad_swiglu_bwd_combine(
         swiglu_clamped=swiglu_clamped,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
+        situ_glu=situ_glu,
+        situ_glu_gate_beta=situ_glu_gate_beta,
+        situ_glu_up_beta=situ_glu_up_beta,
         activation_buffer=activation_buffer,
         activation_offsets=activation_offsets,
         conditional_execution=conditional_execution,

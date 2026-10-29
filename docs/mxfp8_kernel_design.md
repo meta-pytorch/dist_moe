@@ -128,9 +128,18 @@ h1 BF16 in local HBM
   -> 16-byte stores to peer symmetric HBM for combine
 ```
 
-The clamped-SwiGLU specialization changes only the FP32 register expression
-before quantization. Forward, backward, and recomputation receive identical
-static alpha/limit values; qdata, scale layouts, MMA accumulation, and peer
+The clamped-SwiGLU and SiTU-GLU specializations change only the FP32 register
+expression before quantization. SiTU-GLU computes
+
+```text
+b_g = situ_glu_gate_beta * tanh(g / situ_glu_gate_beta)
+b_u = situ_glu_up_beta * tanh(u / situ_glu_up_beta)
+h2  = b_g * sigmoid(g) * b_u
+```
+
+The tanh operations use precise math; sigmoid follows the selected kernel
+fast-math policy. Forward, backward, and recomputation receive identical static
+activation parameters. Qdata, scale layouts, MMA accumulation, and peer
 publication remain unchanged.
 
 <a id="mega-forward"></a>
@@ -243,6 +252,21 @@ Staged backward executes:
 Mega backward replaces the separate DGRAD/WGRAD pairs with
 `mega_blockscaled_grouped_gemm_dgrad_wgrad_dispatch` and
 `mega_blockscaled_grouped_gemm_dgrad_wgrad_swiglu_bwd_combine`.
+
+For SiTU-GLU, the fused activation producer reuses the forward FP32 values and
+applies
+
+```text
+d_b_g/dg = 1 - tanh(g / situ_glu_gate_beta)^2
+d_b_u/du = 1 - tanh(u / situ_glu_up_beta)^2
+d_gate/dg = (d_b_g/dg) * sigmoid(g)
+             + b_g * sigmoid(g) * (1 - sigmoid(g))
+grad_g = grad_h2 * b_u * d_gate/dg
+grad_u = grad_h2 * b_g * sigmoid(g) * d_b_u/du
+```
+
+It quantizes these logical W13-input gradients through the same row/column
+paths used by plain and clamped SwiGLU.
 
 WGRAD MMA accumulates in FP32. Its destination may be BF16 or FP32. Optional
 reduce-add output stores accumulate directly into a caller-owned gradient

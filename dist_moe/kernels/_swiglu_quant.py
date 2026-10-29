@@ -142,6 +142,9 @@ def _load_swiglu_fwd_nvfp4_block(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
 ) -> None:
     x_packed = cute.make_rmem_tensor(8, Int32)
     producer_b_packed = cute.make_rmem_tensor(8, Int32)
@@ -181,6 +184,9 @@ def _load_swiglu_fwd_nvfp4_block(
             clamped,
             alpha,
             limit,
+            situ_glu,
+            situ_glu_gate_beta,
+            situ_glu_up_beta,
         )
         z1 = _apply_block_scaled_quant_producer(
             Float32(x1),
@@ -190,6 +196,9 @@ def _load_swiglu_fwd_nvfp4_block(
             clamped,
             alpha,
             limit,
+            situ_glu,
+            situ_glu_gate_beta,
+            situ_glu_up_beta,
         )
         packed[rep, pair] = _pack_b16x2(
             source_dtype(z0),
@@ -215,6 +224,9 @@ def _load_swiglu_fwd_fp8_tile_values(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     do_row_quant: cutlass.Constexpr[bool],
 ) -> None:
     x_vals_packed = cute.make_rmem_tensor(
@@ -263,6 +275,9 @@ def _load_swiglu_fwd_fp8_tile_values(
                 clamped,
                 alpha,
                 limit,
+                situ_glu,
+                situ_glu_gate_beta,
+                situ_glu_up_beta,
             )
             z1 = _apply_block_scaled_quant_producer(
                 Float32(x_val1),
@@ -272,6 +287,9 @@ def _load_swiglu_fwd_fp8_tile_values(
                 clamped,
                 alpha,
                 limit,
+                situ_glu,
+                situ_glu_gate_beta,
+                situ_glu_up_beta,
             )
             z_vals[rep, 2 * pair] = z0
             z_vals[rep, 2 * pair + 1] = z1
@@ -300,6 +318,9 @@ def _load_swiglu_bwd_dxy_h2_as_f32x2(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     return_h2: cutlass.Constexpr[bool],
 ) -> None:
     dz_vals_packed = cute.make_rmem_tensor(
@@ -362,6 +383,9 @@ def _load_swiglu_bwd_dxy_h2_as_f32x2(
                     clamped,
                     alpha,
                     limit,
+                    situ_glu,
+                    situ_glu_gate_beta,
+                    situ_glu_up_beta,
                 )
             )
         else:
@@ -373,6 +397,9 @@ def _load_swiglu_bwd_dxy_h2_as_f32x2(
                 clamped,
                 alpha,
                 limit,
+                situ_glu,
+                situ_glu_gate_beta,
+                situ_glu_up_beta,
             )
         dx_lane_vals[2 * pair] = dx_pair[0]
         dx_lane_vals[2 * pair + 1] = dx_pair[1]
@@ -402,6 +429,9 @@ def _load_swiglu_bwd_fp8_tile_values(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     return_h2: cutlass.Constexpr[bool],
 ) -> None:
     dx_lane_vals = cute.make_rmem_tensor(num_elems, Float32)
@@ -425,6 +455,9 @@ def _load_swiglu_bwd_fp8_tile_values(
             clamped,
             alpha,
             limit,
+            situ_glu,
+            situ_glu_gate_beta,
+            situ_glu_up_beta,
             return_h2,
         )
         for i in cutlass.range_constexpr(num_elems):
@@ -640,6 +673,9 @@ def _quantize_swiglu_fwd_fp8_tile(  # noqa: C901
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     qdata_elems_per_word: cutlass.Constexpr[int],
     num_elems: cutlass.Constexpr[int],
     col_blocks_per_scale: cutlass.Constexpr[int],
@@ -708,6 +744,9 @@ def _quantize_swiglu_fwd_fp8_tile(  # noqa: C901
         clamped,
         alpha,
         limit,
+        situ_glu,
+        situ_glu_gate_beta,
+        situ_glu_up_beta,
         do_row_quant,
     )
     if cutlass.const_expr(do_row_quant):
@@ -797,6 +836,9 @@ def _quantize_swiglu_bwd_dxy_fp8_tile(  # noqa: C901
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     qdata_elems_per_word: cutlass.Constexpr[int],
     num_elems: cutlass.Constexpr[int],
     col_blocks_per_scale: cutlass.Constexpr[int],
@@ -869,6 +911,9 @@ def _quantize_swiglu_bwd_dxy_fp8_tile(  # noqa: C901
         clamped,
         alpha,
         limit,
+        situ_glu,
+        situ_glu_gate_beta,
+        situ_glu_up_beta,
         False,
     )
 

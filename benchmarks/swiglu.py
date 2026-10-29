@@ -46,7 +46,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--activation", choices=(*ACTIVATIONS, "all"), default="all")
-    parser.add_argument("--pipeline", choices=("bf16",), default="bf16")
+    parser.add_argument(
+        "--pipeline", choices=("bf16", "staged", "mega"), default="bf16"
+    )
+    parser.add_argument("--fast-math", action="store_true")
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--windows", type=int, default=5)
@@ -56,6 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--trace-dir", type=Path)
     parser.add_argument("--source-label", default="current")
+    parser.add_argument("--source-revision", default="unspecified")
     args = parser.parse_args(argv)
     for field in (
         "tokens",
@@ -73,6 +77,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--profile-steps cannot be negative")
     if args.top_k > args.experts:
         parser.error("--top-k cannot exceed --experts")
+    if args.fast_math and args.pipeline == "bf16":
+        parser.error("--fast-math is an MXFP8-only option")
     return args
 
 
@@ -96,6 +102,15 @@ def make_config(args: argparse.Namespace, activation: str) -> dist_moe.Config:
         num_activation_slots=1,
         activation_slot_capacity_factor=1.0,
         device_scratch_capacity_factor=1.0,
+        block_scaled=(
+            None
+            if args.pipeline == "bf16"
+            else dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.MXFP8_E4M3,
+                pipeline=args.pipeline,
+                fast_math=args.fast_math,
+            )
+        ),
         activation=activation,
         wgrad_dtype=torch.bfloat16,
     )
@@ -355,7 +370,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             props = torch.cuda.get_device_properties(device)
             result = {
                 "source_label": args.source_label,
+                "source_revision": args.source_revision,
+                "source_file": str(Path(dist_moe.__file__).resolve()),
+                "driver_file": str(Path(__file__).resolve()),
                 "pipeline": args.pipeline,
+                "fast_math": args.fast_math,
                 "mode": args.mode,
                 "world_size": world_size,
                 "local_tokens": args.tokens,

@@ -37,9 +37,9 @@ All supported modes work with non-strict `make_fx`, CUDA graphs, and optional
 VMM host-backed scratch. Training modes include forward and backward.
 
 The package also supports prepared MXFP8 and NVFP4 weights, device-selected
-activation slots, plain and clamped SwiGLU, BF16 SiTU-GLU, fused post-expert
-RMSNorm, clip statistics, and optional in-place accumulation into standard
-`parameter.grad` buffers.
+activation slots, plain and clamped SwiGLU, BF16 and MXFP8 E4M3 SiTU-GLU,
+fused post-expert RMSNorm, clip statistics, and optional in-place accumulation
+into standard `parameter.grad` buffers.
 
 <details>
 <summary>Not supported in this release</summary>
@@ -332,8 +332,9 @@ the same public tensor and memory contracts. See
 
 ### SiTU-GLU
 
-Bounded SiTU-GLU is available for BF16 execution. Apply this fragment before
-calling `dist_moe.create_context()`:
+Bounded SiTU-GLU is available for BF16 and MXFP8 E4M3 execution, including both
+the staged and Mega MXFP8 pipelines. Apply this fragment before calling
+`dist_moe.create_context()`:
 
 ```python
 import dataclasses
@@ -341,17 +342,17 @@ import dataclasses
 config = dataclasses.replace(
     config,
     activation="situ_glu",
-    situ_glu_beta=4.0,
-    situ_glu_linear_beta=25.0,
+    situ_glu_gate_beta=4.0,
+    situ_glu_up_beta=25.0,
 )
 ```
 
 For gate value `g` and up-projection value `u`, the kernel evaluates
-`(situ_glu_beta * tanh(g / situ_glu_beta) * sigmoid(g)) *
-(situ_glu_linear_beta * tanh(u / situ_glu_linear_beta))` in FP32 and writes
-BF16 output. Forward, backward, and conditional forward recomputation use the
-same static bounds.
-Block-scaled SiTU-GLU is not yet supported.
+`(situ_glu_gate_beta * tanh(g / situ_glu_gate_beta) * sigmoid(g)) *
+(situ_glu_up_beta * tanh(u / situ_glu_up_beta))` in FP32. BF16 writes the
+activation directly; MXFP8 quantizes the result for W2. Forward, backward, and
+conditional forward recomputation use the same static bounds. Other block-scaled formats,
+including NVFP4, do not support SiTU-GLU.
 
 ### NVFP4
 

@@ -15,7 +15,10 @@ import cutlass
 import torch
 
 from ..formats import (
+    canonical_situ_glu,
     canonical_swiglu_clamp,
+    SITU_GLU_GATE_BETA_DEFAULT,
+    SITU_GLU_UP_BETA_DEFAULT,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
@@ -40,6 +43,7 @@ from .blockscaled_grouped_gemm import (
     _parse_blockscaled_problem,
     _resolve_output_tensor,
     _resolve_weight_format,
+    _set_situ_glu_config,
     _set_swiglu_clamp_config,
     _torch_dtype,
     _torch_layout_signature,
@@ -682,6 +686,11 @@ def _get_chunked_kernel(  # noqa: C901
         SWIGLU_CLAMP_ALPHA_DEFAULT,
         SWIGLU_CLAMP_LIMIT_DEFAULT,
     ),
+    situ_glu_config: tuple[bool, float, float] = (
+        False,
+        SITU_GLU_GATE_BETA_DEFAULT,
+        SITU_GLU_UP_BETA_DEFAULT,
+    ),
     activation_ring_h1_done_offset: int = 0,
     weight_borrow_slots: int = 0,
     weight_borrow_work_offset: int = 0,
@@ -706,6 +715,7 @@ def _get_chunked_kernel(  # noqa: C901
         world_size,
         swiglu_fast_math,
         swiglu_clamp,
+        situ_glu_config,
         chunk_rows,
         quantize_dispatch,
         swiglu_row_quant_only,
@@ -739,6 +749,7 @@ def _get_chunked_kernel(  # noqa: C901
         if swiglu_fast_math:
             kernel_config["COMBINE_SWIGLU_FAST_MATH"] = True
         _set_swiglu_clamp_config(kernel_config, *swiglu_clamp)
+        _set_situ_glu_config(kernel_config, *situ_glu_config)
         if swiglu_row_quant_only:
             kernel_config["COMBINE_SWIGLU_ROW_QUANT_ONLY"] = True
         kernel_cls = (
@@ -1259,6 +1270,9 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     chunk_rows: int | None = 512,
     return_x_wgrad_quant: bool = False,
     blockscaled_dispatch: bool = False,
@@ -2425,6 +2439,11 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
     weight_borrow_work_offset = 0
     weight_borrow_done_offset = 0
     swiglu_clamp = canonical_swiglu_clamp(swiglu_clamped, swiglu_alpha, swiglu_limit)
+    situ_glu_config = canonical_situ_glu(
+        situ_glu,
+        situ_glu_gate_beta,
+        situ_glu_up_beta,
+    )
     if (
         auto_inference_tuning
         and auto_decode_config
@@ -2536,6 +2555,7 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
         groups=groups,
         swiglu_fast_math=swiglu_fast_math,
         swiglu_clamp=swiglu_clamp,
+        situ_glu_config=situ_glu_config,
         chunk_rows=chunk_rows,
         quantize_dispatch=not blockscaled_dispatch,
         swiglu_row_quant_only=not return_h2_wgrad_quant,
@@ -2677,6 +2697,7 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
         fc2_elem_sizes,
         swiglu_fast_math,
         swiglu_clamp,
+        situ_glu_config,
         blockscaled_dispatch,
         nvfp4_high_throughput,
         nvfp4_wide_row_quant,

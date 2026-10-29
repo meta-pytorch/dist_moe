@@ -42,6 +42,9 @@ config = dist_moe.Config(
         format=dist_moe.BlockScaledFormat.MXFP8_E4M3,
         pipeline="staged",  # or "mega"
     ),
+    activation="situ_glu",  # Optional; plain SwiGLU is the default.
+    situ_glu_gate_beta=4.0,
+    situ_glu_up_beta=25.0,
 )
 context = dist_moe.create_context(group=ep_group, config=config)
 output_TD = dist_moe.routed_experts(
@@ -57,6 +60,23 @@ output_TD = dist_moe.routed_experts(
 `x`, route scores, and the returned output are ordinary PyTorch tensors.
 Block-scaled activation bundles and planner offsets are context-owned buffer
 state. Routing remains external.
+
+SiTU-GLU is supported by both MXFP8 pipelines. For gate value `g` and
+up-projection value `u`, it evaluates
+`(situ_glu_gate_beta * tanh(g / situ_glu_gate_beta) * sigmoid(g)) *
+(situ_glu_up_beta * tanh(u / situ_glu_up_beta))` in FP32 before quantizing
+the W2 input.
+The gate and up bounds are static kernel specializations shared by forward,
+backward, and conditional recomputation. Other block-scaled formats do not
+support this activation.
+
+Both SiTU-GLU tanhs use precise CUDA math (`fastmath=False`). For `situ_glu_gate_beta=4.0`,
+the shared forward/backward helper reuses `t = tanh(g / 4)` and evaluates
+`sigmoid(g) = 0.5 + t / (1 + t * t)` in FP32. This is a real-arithmetic
+identity with normal FP32 rounding, not bitwise independent-sigmoid parity.
+`BlockScaledConfig.fast_math` does not change this reuse path or either tanh;
+it controls the independent sigmoid only for other gate bounds. Plain and
+clamped SwiGLU retain their existing sigmoid precision policy.
 
 `dist_moe.plan_memory()` exposes the padded row bound used by the planner and
 grouped GEMMs. For example, 16 local tokens, top-2 routing, two local experts,
@@ -378,6 +398,12 @@ this fused producer. Gate/up clamping and the sigmoid are evaluated
 in FP32 before `h2` is quantized; backward and conditional recomputation receive
 the same static `swiglu_alpha` and `swiglu_limit` values.
 
+`dist_moe.Config(activation="situ_glu")` instead selects bounded SiTU-GLU. Both
+tanh bounds and the sigmoid are evaluated in FP32 before the same row/column
+MXFP8 quantization. The fused backward differentiates the bounded gate and up
+projection and returns the same logical W13 DGRAD and WGRAD operands as plain
+SwiGLU.
+
 <a id="follow-the-mega-forward"></a>
 ## Follow the Mega forward
 
@@ -385,6 +411,9 @@ the same static `swiglu_alpha` and `swiglu_limit` values.
 W2, and combine publication into one chunked pipeline. Training produces the same
 logical BF16 output and the same planner-owned saved state. Mega is a launch
 topology choice, not a different quantization or memory API.
+
+Plain, clamped, and SiTU-GLU use the same Mega scheduling and storage layout;
+only the FP32 activation expression before W2 quantization changes.
 
 For the running example, the logical states remain `E0[A,C], E1[B,D]`; Mega
 only pipelines their W13, activation, W2, and peer-store tiles inside one
@@ -428,6 +457,8 @@ token owners; W13 and W2 gradients remain with rank 0's local expert weights.
 `get_backward_plan()` selects saved activation bundles or conditional
 recompute scratch. The fixed recompute path regenerates W13 input quantization,
 `h1`, SwiGLU, and W2 input quantization when `need_recompute` is true.
+For SiTU-GLU, both recomputation and the fused activation backward reuse the
+forward `situ_glu_gate_beta` and `situ_glu_up_beta` specializations.
 
 The staged kernel order is:
 

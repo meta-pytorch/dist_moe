@@ -8,9 +8,12 @@ predict throughput.
 
 ```bash
 for ranks in 1 2 4; do
-  python -m torch.distributed.run --standalone --nproc-per-node="$ranks" \
-    benchmarks/swiglu.py --mode graph --pipeline bf16 \
-    --output "results/bf16-${ranks}.json" --trace-dir "results/traces-${ranks}"
+  for pipeline in bf16 staged mega; do
+    python -m torch.distributed.run --standalone --nproc-per-node="$ranks" \
+      benchmarks/swiglu.py --mode graph --pipeline "$pipeline" \
+      --output "results/${pipeline}-${ranks}.json" \
+      --trace-dir "results/traces-${pipeline}-${ranks}"
+  done
 done
 ```
 
@@ -21,6 +24,11 @@ capacity factor 1.0, device scratch factor 1.0, no VMM, and BF16 WGRAD. The
 training call includes forward, DGRAD, WGRAD, planner rewind, and any dynamic
 weight preparation. It excludes optimizer, FSDP, and model/framework overhead.
 For lifecycle details, see [BF16 execution](bf16_execution.md).
+MXFP8 defaults to `fast_math=False`; `--fast-math` explicitly selects the
+approximate independent sigmoid for staged or Mega comparisons. Use the same
+flag for all three activations and both source revisions. SiTU-GLU tanhs
+remain precise, and a gate bound of four shares the tanh under either flag. For
+fused-pipeline contracts, see [MXFP8 execution](mxfp8_execution.md).
 
 Ten warmup calls precede compilation-free measurement. Graph mode additionally
 warms a separate stream, captures a complete training call, and requires exact

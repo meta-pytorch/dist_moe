@@ -7,7 +7,12 @@
 import cutlass
 import cutlass.cute as cute
 
-from ..formats import SWIGLU_CLAMP_ALPHA_DEFAULT, SWIGLU_CLAMP_LIMIT_DEFAULT
+from ..formats import (
+    SITU_GLU_GATE_BETA_DEFAULT,
+    SITU_GLU_UP_BETA_DEFAULT,
+    SWIGLU_CLAMP_ALPHA_DEFAULT,
+    SWIGLU_CLAMP_LIMIT_DEFAULT,
+)
 from ._grouped_gemm_config import (
     BLOCKSCALED_SWIZZLE_GROUP_SIZE,
 )
@@ -31,6 +36,7 @@ from .blockscaled_quantization_common import (
     _load_tensor_row_as_b16x2,
     _mul_f32x2,
     _sigmoid_f32,
+    _situ_glu_fwd_f32,
     _swiglu_clamped_fwd_f32,
 )
 from .grouped_gemm_kernel import (
@@ -103,6 +109,9 @@ def _load_interleaved_swiglu_values(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     swizzle_group_size: cutlass.Constexpr[int],
     values_per_thread: cutlass.Constexpr[int],
 ) -> cute.Tensor:
@@ -140,6 +149,15 @@ def _load_interleaved_swiglu_values(
                 result = (
                     _swiglu_clamped_fwd_f32(gate[0], up[0], alpha, limit, fast_math),
                     _swiglu_clamped_fwd_f32(gate[1], up[1], alpha, limit, fast_math),
+                )
+            elif cutlass.const_expr(situ_glu):
+                result = (
+                    _situ_glu_fwd_f32(
+                        gate[0], up[0], situ_glu_gate_beta, situ_glu_up_beta, fast_math
+                    ),
+                    _situ_glu_fwd_f32(
+                        gate[1], up[1], situ_glu_gate_beta, situ_glu_up_beta, fast_math
+                    ),
                 )
             else:
                 sigmoid = (
@@ -182,6 +200,9 @@ def store_interleaved_swiglu_smem_tile(
     clamped: cutlass.Constexpr[bool] = False,
     alpha: cutlass.Constexpr[float] = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: cutlass.Constexpr[float] = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: cutlass.Constexpr[bool] = False,
+    situ_glu_gate_beta: cutlass.Constexpr[float] = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: cutlass.Constexpr[float] = SITU_GLU_UP_BETA_DEFAULT,
 ) -> None:
     packed_words: cutlass.Constexpr[int] = swizzle_group_size // 2
     epi_m: cutlass.Constexpr[int] = cute.size(sC_stage.shape, mode=[0])
@@ -232,6 +253,9 @@ def store_interleaved_swiglu_smem_tile(
                     clamped,
                     alpha,
                     limit,
+                    situ_glu,
+                    situ_glu_gate_beta,
+                    situ_glu_up_beta,
                     swizzle_group_size,
                     swizzle_group_size,
                 )
@@ -278,6 +302,9 @@ def store_interleaved_swiglu_epilogue(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     swap_ab: cutlass.Constexpr[bool],
 ) -> None:
     # Under SWAP_AB the feature axis becomes the output column axis, and the
@@ -312,6 +339,9 @@ def store_interleaved_swiglu_epilogue(
             clamped=clamped,
             alpha=alpha,
             limit=limit,
+            situ_glu=situ_glu,
+            situ_glu_gate_beta=situ_glu_gate_beta,
+            situ_glu_up_beta=situ_glu_up_beta,
             swizzle_group_size=BLOCKSCALED_SWIZZLE_GROUP_SIZE,
         )
     else:
@@ -340,6 +370,9 @@ def store_interleaved_swiglu_epilogue(
             clamped=clamped,
             alpha=alpha,
             limit=limit,
+            situ_glu=situ_glu,
+            situ_glu_gate_beta=situ_glu_gate_beta,
+            situ_glu_up_beta=situ_glu_up_beta,
             swizzle_group_size=BLOCKSCALED_SWIZZLE_GROUP_SIZE,
         )
 
@@ -372,6 +405,9 @@ def quantize_interleaved_swiglu_mx_smem_tile(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     format_id: cutlass.Constexpr[int],
     qdata_elems_per_word: cutlass.Constexpr[int],
     values_per_thread: cutlass.Constexpr[int],
@@ -441,6 +477,9 @@ def quantize_interleaved_swiglu_mx_smem_tile(
                     clamped,
                     alpha,
                     limit,
+                    situ_glu,
+                    situ_glu_gate_beta,
+                    situ_glu_up_beta,
                     BLOCKSCALED_SWIZZLE_GROUP_SIZE,
                     values_per_thread,
                 )
@@ -529,6 +568,9 @@ def quantize_interleaved_swiglu_mx_epilogue(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     format_id: cutlass.Constexpr[int],
     qdata_elems_per_word: cutlass.Constexpr[int],
     swap_ab: cutlass.Constexpr[bool],
@@ -569,6 +611,9 @@ def quantize_interleaved_swiglu_mx_epilogue(
             clamped=clamped,
             alpha=alpha,
             limit=limit,
+            situ_glu=situ_glu,
+            situ_glu_gate_beta=situ_glu_gate_beta,
+            situ_glu_up_beta=situ_glu_up_beta,
             format_id=format_id,
             qdata_elems_per_word=qdata_elems_per_word,
             values_per_thread=values_per_thread,
@@ -602,6 +647,9 @@ def quantize_interleaved_swiglu_mx_epilogue(
             clamped=clamped,
             alpha=alpha,
             limit=limit,
+            situ_glu=situ_glu,
+            situ_glu_gate_beta=situ_glu_gate_beta,
+            situ_glu_up_beta=situ_glu_up_beta,
             format_id=format_id,
             qdata_elems_per_word=qdata_elems_per_word,
             values_per_thread=values_per_thread,
@@ -706,6 +754,9 @@ def blockscaled_epilog_postprocess_store(
     clamped: cutlass.Constexpr[bool],
     alpha: cutlass.Constexpr[float],
     limit: cutlass.Constexpr[float],
+    situ_glu: cutlass.Constexpr[bool],
+    situ_glu_gate_beta: cutlass.Constexpr[float],
+    situ_glu_up_beta: cutlass.Constexpr[float],
     swap_ab: cutlass.Constexpr[bool],
     format_id: cutlass.Constexpr[int],
     qdata_elems_per_word: cutlass.Constexpr[int],
@@ -751,6 +802,9 @@ def blockscaled_epilog_postprocess_store(
             clamped=clamped,
             alpha=alpha,
             limit=limit,
+            situ_glu=situ_glu,
+            situ_glu_gate_beta=situ_glu_gate_beta,
+            situ_glu_up_beta=situ_glu_up_beta,
             swap_ab=swap_ab,
         )
         return
@@ -784,6 +838,9 @@ def blockscaled_epilog_postprocess_store(
         clamped=clamped,
         alpha=alpha,
         limit=limit,
+        situ_glu=situ_glu,
+        situ_glu_gate_beta=situ_glu_gate_beta,
+        situ_glu_up_beta=situ_glu_up_beta,
         format_id=format_id,
         qdata_elems_per_word=qdata_elems_per_word,
         swap_ab=swap_ab,

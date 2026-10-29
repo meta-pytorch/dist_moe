@@ -108,9 +108,8 @@ class BlockScaledProducer(enum.IntEnum):
 SWIGLU_CLAMP_ALPHA_DEFAULT = 1.702
 SWIGLU_CLAMP_LIMIT_DEFAULT = 7.0
 
-# SiTU-GLU defaults. Shared by the public configuration and BF16 activation
-# kernels so forward, backward, and recomputation specialize on identical
-# values.
+# SiTU-GLU defaults. Shared by the public configuration and activation kernels
+# so forward, backward, and recomputation specialize on identical values.
 SITU_GLU_GATE_BETA_DEFAULT = 4.0
 SITU_GLU_UP_BETA_DEFAULT = 25.0
 

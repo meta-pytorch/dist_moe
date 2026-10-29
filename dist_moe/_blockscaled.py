@@ -1276,6 +1276,7 @@ def _async_model_config(
 
 
 _SWIGLU_CLAMPED = "swiglu_clamped"
+_SITU_GLU = "situ_glu"
 
 
 def _postprocess_save_condition(
@@ -1360,6 +1361,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
         activation: str = "swiglu",
         swiglu_alpha: float = 1.702,
         swiglu_limit: float = 7.0,
+        situ_glu_gate_beta: float = 4.0,
+        situ_glu_up_beta: float = 25.0,
         activation_slot_id_1: torch.Tensor | None = None,
         num_moe_layers_in_slot: int | None = None,
         validate_expert_ids: bool = False,
@@ -1411,6 +1414,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
             activation: SwiGLU variant.
             swiglu_alpha: Clamped-SwiGLU alpha.
             swiglu_limit: Clamped-SwiGLU input limit.
+            situ_glu_gate_beta: Gate tanh bound for SiTU-GLU.
+            situ_glu_up_beta: Up-projection tanh bound for SiTU-GLU.
             activation_slot_id_1: Device scalar selecting the activation slot.
             num_moe_layers_in_slot: Static layer count used to bound the
                 selected pipeline activation slot.
@@ -1473,6 +1478,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
         ctx.activation = activation
         ctx.swiglu_alpha = swiglu_alpha
         ctx.swiglu_limit = swiglu_limit
+        ctx.situ_glu_gate_beta = situ_glu_gate_beta
+        ctx.situ_glu_up_beta = situ_glu_up_beta
         ctx.wgrad_output_dtype = wgrad_output_dtype
         ctx.wgrad_destination_fn = wgrad_destination_fn
         ctx.inference_mode = inference_mode
@@ -1745,6 +1752,9 @@ class _BlockScaledAutograd(torch.autograd.Function):
                             swiglu_clamped=activation == _SWIGLU_CLAMPED,
                             swiglu_alpha=swiglu_alpha,
                             swiglu_limit=swiglu_limit,
+                            situ_glu=activation == _SITU_GLU,
+                            situ_glu_gate_beta=situ_glu_gate_beta,
+                            situ_glu_up_beta=situ_glu_up_beta,
                             return_x_wgrad_quant=save_col_quant,
                             blockscaled_dispatch=blockscaled_dispatch,
                             return_h2_wgrad_quant=save_col_quant,
@@ -1832,6 +1842,9 @@ class _BlockScaledAutograd(torch.autograd.Function):
                             swiglu_clamped=activation == _SWIGLU_CLAMPED,
                             swiglu_alpha=swiglu_alpha,
                             swiglu_limit=swiglu_limit,
+                            situ_glu=activation == _SITU_GLU,
+                            situ_glu_gate_beta=situ_glu_gate_beta,
+                            situ_glu_up_beta=situ_glu_up_beta,
                             activation_buffer=activation_buffer.buffer,
                             activation_offsets=forward_plan.blockscaled.combine_offsets,
                             num_recv_tokens=capacity_rows,
@@ -1985,6 +1998,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
         activation = ctx.activation
         swiglu_alpha = ctx.swiglu_alpha
         swiglu_limit = ctx.swiglu_limit
+        situ_glu_gate_beta = ctx.situ_glu_gate_beta
+        situ_glu_up_beta = ctx.situ_glu_up_beta
         expert_postprocess_output_dtype = ctx.expert_postprocess_output_dtype
         topk = ctx.topk
         num_tokens = ctx.num_local_input_tokens
@@ -2175,6 +2190,9 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         swiglu_clamped=activation == _SWIGLU_CLAMPED,
                         swiglu_alpha=swiglu_alpha,
                         swiglu_limit=swiglu_limit,
+                        situ_glu=activation == _SITU_GLU,
+                        situ_glu_gate_beta=situ_glu_gate_beta,
+                        situ_glu_up_beta=situ_glu_up_beta,
                         blockscaled_dispatch=False,
                         return_x_wgrad_quant=save_col_quant,
                         return_h2_wgrad_quant=save_col_quant,
@@ -2233,6 +2251,9 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         swiglu_clamped=activation == _SWIGLU_CLAMPED,
                         swiglu_alpha=swiglu_alpha,
                         swiglu_limit=swiglu_limit,
+                        situ_glu=activation == _SITU_GLU,
+                        situ_glu_gate_beta=situ_glu_gate_beta,
+                        situ_glu_up_beta=situ_glu_up_beta,
                         activation_buffer=activation_buffer.buffer,
                         activation_offsets=backward_plan.blockscaled.recompute_combine_offsets,
                         conditional_execution=conditional_recompute,
@@ -2457,6 +2478,9 @@ class _BlockScaledAutograd(torch.autograd.Function):
                             swiglu_clamped=activation == _SWIGLU_CLAMPED,
                             swiglu_alpha=swiglu_alpha,
                             swiglu_limit=swiglu_limit,
+                            situ_glu=activation == _SITU_GLU,
+                            situ_glu_gate_beta=situ_glu_gate_beta,
+                            situ_glu_up_beta=situ_glu_up_beta,
                             activation_buffer=activation_buffer.buffer,
                             activation_offsets=backward_plan.blockscaled.fc13_mega_offsets,
                         )
@@ -2483,6 +2507,9 @@ class _BlockScaledAutograd(torch.autograd.Function):
                             swiglu_clamped=activation == _SWIGLU_CLAMPED,
                             swiglu_alpha=swiglu_alpha,
                             swiglu_limit=swiglu_limit,
+                            situ_glu=activation == _SITU_GLU,
+                            situ_glu_gate_beta=situ_glu_gate_beta,
+                            situ_glu_up_beta=situ_glu_up_beta,
                             activation_buffer=activation_buffer.buffer,
                             activation_offsets=backward_plan.blockscaled.fc13_dgrad_offsets,
                             num_recv_tokens=capacity_rows,
@@ -2546,7 +2573,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
             grad_topk_scores_TK,
             None if external_wgrad_destination else grad_w13_EFD,
             None if external_wgrad_destination else grad_w2_EDF,
-            *((None,) * 37),
+            *((None,) * 39),
         )
 
 
@@ -2628,6 +2655,8 @@ def _run_blockscaled_eager(
     activation: str = "swiglu",
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
+    situ_glu_gate_beta: float = 4.0,
+    situ_glu_up_beta: float = 25.0,
     activation_slot_id_1: torch.Tensor | None = None,
     num_moe_layers_in_slot: int | None = None,
     validate_expert_ids: bool = False,
@@ -2674,6 +2703,8 @@ def _run_blockscaled_eager(
         activation: SwiGLU implementation selected by the caller.
         swiglu_alpha: Sigmoid multiplier for clamped SwiGLU.
         swiglu_limit: Symmetric preactivation limit for clamped SwiGLU.
+        situ_glu_gate_beta: Gate tanh bound for SiTU-GLU.
+        situ_glu_up_beta: Up-projection tanh bound for SiTU-GLU.
         activation_slot_id_1: Optional graph-stable activation-stack index.
         num_moe_layers_in_slot: Static number of MoE layers sharing the
             selected activation slot.
@@ -2850,6 +2881,8 @@ def _run_blockscaled_eager(
         activation,
         swiglu_alpha,
         swiglu_limit,
+        situ_glu_gate_beta,
+        situ_glu_up_beta,
         (
             activation_buffer.activation_slot_id_1
             if activation_slot_id_1 is None
@@ -3439,6 +3472,8 @@ def _run_async_forward(
         activation=context.config.activation,
         swiglu_alpha=context.config.swiglu_alpha,
         swiglu_limit=context.config.swiglu_limit,
+        situ_glu_gate_beta=context.config.situ_glu_gate_beta,
+        situ_glu_up_beta=context.config.situ_glu_up_beta,
         activation_slot_id_1=activation_slot_id_1,
         num_moe_layers_in_slot=num_moe_layers_in_slot,
         validate_expert_ids=validate_expert_ids,
@@ -3797,6 +3832,8 @@ def _run_block_scaled_registered_backward(
         activation=context.config.activation,
         swiglu_alpha=context.config.swiglu_alpha,
         swiglu_limit=context.config.swiglu_limit,
+        situ_glu_gate_beta=context.config.situ_glu_gate_beta,
+        situ_glu_up_beta=context.config.situ_glu_up_beta,
     )
     routing = state[_BACKWARD_ROUTING_STATE]
     (
@@ -4561,6 +4598,8 @@ def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public executio
         activation=context.config.activation,
         swiglu_alpha=context.config.swiglu_alpha,
         swiglu_limit=context.config.swiglu_limit,
+        situ_glu_gate_beta=context.config.situ_glu_gate_beta,
+        situ_glu_up_beta=context.config.situ_glu_up_beta,
         activation_slot_id_1=activation_buffer.activation_slot_id_1,
         num_moe_layers_in_slot=activation_buffer._num_moe_layers_in_selected_slot,
         validate_expert_ids=options.validate_expert_ids,

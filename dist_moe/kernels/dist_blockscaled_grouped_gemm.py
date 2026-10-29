@@ -24,7 +24,12 @@ import cutlass.torch as cutlass_torch
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from ..formats import SWIGLU_CLAMP_ALPHA_DEFAULT, SWIGLU_CLAMP_LIMIT_DEFAULT
+from ..formats import (
+    SITU_GLU_GATE_BETA_DEFAULT,
+    SITU_GLU_UP_BETA_DEFAULT,
+    SWIGLU_CLAMP_ALPHA_DEFAULT,
+    SWIGLU_CLAMP_LIMIT_DEFAULT,
+)
 from ._environment import num_sms_per_device
 from .activation_buffer import (
     _qdata_words,
@@ -52,6 +57,7 @@ from .blockscaled_grouped_gemm import (
     _make_pointer_stride_args,
     _parse_blockscaled_problem,
     _resolve_output_tensor,
+    _set_situ_glu_config,
     _set_swiglu_clamp_config,
     _torch_dtype,
     _torch_layout_signature,
@@ -413,6 +419,9 @@ def _fused_dist_blockscaled_grouped_gemm_combine_impl(  # noqa: C901
     combine_swiglu_clamped: bool = False,
     combine_swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     combine_swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    combine_situ_glu: bool = False,
+    combine_situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    combine_situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     combine_swiglu_row_quant_only: bool = False,
     combine_precomputed_swiglu: bool = False,
     activation_buffer: torch.Tensor | None = None,
@@ -654,6 +663,12 @@ def _fused_dist_blockscaled_grouped_gemm_combine_impl(  # noqa: C901
     if use_combine_swiglu:
         _set_swiglu_clamp_config(
             cfg, combine_swiglu_clamped, combine_swiglu_alpha, combine_swiglu_limit
+        )
+        _set_situ_glu_config(
+            cfg,
+            combine_situ_glu,
+            combine_situ_glu_gate_beta,
+            combine_situ_glu_up_beta,
         )
     if use_combine_swiglu_fwd and combine_swiglu_row_quant_only:
         cfg["COMBINE_SWIGLU_ROW_QUANT_ONLY"] = True
@@ -1938,6 +1953,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(  # noqa: C901
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -2145,6 +2163,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(  # noqa: C901
         combine_swiglu_clamped=swiglu_clamped,
         combine_swiglu_alpha=swiglu_alpha,
         combine_swiglu_limit=swiglu_limit,
+        combine_situ_glu=situ_glu,
+        combine_situ_glu_gate_beta=situ_glu_gate_beta,
+        combine_situ_glu_up_beta=situ_glu_up_beta,
         combine_swiglu_row_quant_only=not return_wgrad_quant,
         combine_precomputed_swiglu=precomputed_swiglu,
         activation_buffer=activation_buffer,
@@ -2191,6 +2212,9 @@ def dist_blockscaled_grouped_gemm_dgrad_swiglu_bwd_combine(
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    situ_glu: bool = False,
+    situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT,
+    situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -2307,6 +2331,9 @@ def dist_blockscaled_grouped_gemm_dgrad_swiglu_bwd_combine(
         combine_swiglu_clamped=swiglu_clamped,
         combine_swiglu_alpha=swiglu_alpha,
         combine_swiglu_limit=swiglu_limit,
+        combine_situ_glu=situ_glu,
+        combine_situ_glu_gate_beta=situ_glu_gate_beta,
+        combine_situ_glu_up_beta=situ_glu_up_beta,
         activation_buffer=activation_buffer,
         activation_offsets=activation_offsets,
         conditional_execution=conditional_execution,
