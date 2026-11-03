@@ -57,26 +57,6 @@ CUDA_VISIBLE_DEVICES=0 \
   tests/test_dist_moe.py::DistMoeKernelTest::test_nvfp4_reference_scale_order_matches_dist_moe_quantization
 ```
 
-## Fake-quantized supporting tests
-
-`_reference_moe_nvfp4_fake_quant` uses the same inlined scale calculation as
-the real-quantized reference, including Dist-MoE's multiply-then-rounded-`1/6`
-operation order. Its STE still dequantizes the operands and evaluates the
-expert projections with `F.linear`, so it isolates fake BF16 GEMM from real
-NVFP4 tensor-core accumulation.
-
-The focused two-GPU inference comparison is:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-  python -m pytest -q \
-  tests/test_dist_moe.py::DistMoeTwoRankTest::test_nvfp4_inference_exercises_peer_paths_fq
-```
-
-Its forward relative-L2 limit is `2.5e-4`; the remaining error is from
-dequantized `F.linear` versus real NVFP4 compute, not different FP4 rounding
-boundaries.
-
 ## One-GPU test
 
 `test_nvfp4_training_backward_matches_real_quant_reference` uses a
