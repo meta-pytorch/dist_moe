@@ -188,7 +188,10 @@ creates saved activation state, and concat remains the default weight layout.
 Training always uses GPU-planned offsets. Its hybrid layout combines dense
 BF16 saved operands with transient packed NVFP4 row bundles. Full-save retains
 `DQ(Q(X_gathered))`, H1, and H3; recompute retains local BF16 X. The row-bundle
-decoder converts Q(X) and Q(H2) before their scratch is reused.
+decoder converts Q(X) and Q(H2) before their scratch is reused. Its packed
+source and expanding BF16 destination remain disjoint for the full kernel
+lifetime because independently scheduled decoder programs have no grid-wide
+ordering.
 
 G8 with GPU offsets requires the source high-throughput producer topology.
 Its padded allocation row bound is at least `16 * num_sms`, and the

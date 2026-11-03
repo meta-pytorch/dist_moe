@@ -1653,16 +1653,16 @@ class ModelConfig:
     ) -> int:
         """Conservatively reserve the future dense-backward working set.
 
-        The backward implementation lands in a later change. Reserving its
-        BF16 gradient workspace now keeps the forward planner's shared scratch
-        boundary stable when that consumer is connected.
+        The BF16 gradient workspace reuses dense tensors according to their
+        kernel-level lifetimes. The packed H2 source remains disjoint from its
+        expanding BF16 dequantization destination until that kernel completes.
 
         Args:
             num_recv_tokens: Capacity-padded received rows.
             recompute: Whether the NVFP4 forward operands must be recreated.
 
         Returns:
-            Dense BF16 backward bytes plus recompute-only row scratch.
+            Dense BF16 backward bytes plus transient row scratch.
         """
         grad_h1_size = _align_bytes(
             num_recv_tokens * 2 * self.intermediate_dim * self.element_size
@@ -1677,7 +1677,13 @@ class ModelConfig:
         if self.hidden_dim > self.intermediate_dim:
             gradient_scratch += grad_h3_size
         if not recompute:
-            return gradient_scratch
+            storage = self.blockscaled_storage
+            assert storage is not None
+            h2_row_size = storage.row_quant_size(
+                num_recv_tokens,
+                self.intermediate_dim,
+            )
+            return h2_row_size + gradient_scratch
 
         x_gathered_size = _align_bytes(
             num_recv_tokens * self.hidden_dim * self.element_size

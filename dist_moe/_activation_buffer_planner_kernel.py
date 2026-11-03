@@ -745,10 +745,11 @@ def _triton_get_blockscaled_backward_plan(
       recompute     scratch [row slot | h1 | x_gathered | h2 | grad_h3_gathered | grad_h2 | grad_h1]
 
     With save_dequantized_activations, X and H1 already use the BF16 backward
-    representation. Recompute temporarily needs the NVFP4 row slot before the
+    representation. Both decisions keep the active NVFP4 row bundle above the
     same liveness-aware dense gradient workspace used by the BF16 planner:
 
-      no-recompute  scratch [h2/grad_h1 | grad_h2 | grad_h3_gathered]
+      no-recompute  scratch [h2 row | h2/grad_h1 | grad_h2 |
+                             grad_h3_gathered]
       recompute     scratch [row slot | h2/grad_h1 | grad_h2 |
                              grad_h3_gathered | h1 | x_gathered]
 
@@ -823,8 +824,8 @@ def _triton_get_blockscaled_backward_plan(
         )
     no_recompute_row_slot_size = tl.maximum(x_row_size, dxy_row_size)
     if save_dequantized_activations:
-        # A saved layer regenerates only H2's row quant. It can overlap H2's
-        # future dense destination because dequantization ends that lifetime.
+        # A saved layer regenerates only H2's row quant. Keep that bundle live
+        # above the dense workspace until the parallel dequantizer completes.
         row_slot_size = tl.where(need_recompute, recompute_row_slot_size, h2_row_size)
     else:
         row_slot_size = tl.where(
@@ -882,8 +883,9 @@ def _triton_get_blockscaled_backward_plan(
     if save_dequantized_activations:
         # Match the BF16 backward's liveness reuse. Recompute keeps the NVFP4
         # row slot disjoint until X has been dequantized and H2 has been
-        # produced; a saved layer may reuse the future dense H2 destination.
-        dense_scratch_end = tl.where(need_recompute, row_slot_offset, scratch_end)
+        # produced. A saved layer also needs a disjoint H2 destination because
+        # the parallel dequantizer cannot safely expand over its source bundle.
+        dense_scratch_end = row_slot_offset
         grad_h1_offset = dense_scratch_end - h1_size
         grad_h2_offset = grad_h1_offset - grad_h2_size
         h2_offset = dense_scratch_end - grad_h2_size

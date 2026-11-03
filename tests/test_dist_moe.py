@@ -2939,6 +2939,7 @@ class DistMoeKernelTest(unittest.TestCase):
         situ_glu_linear_beta: float = 25.0,
         inference: bool = True,
         block_scaled: dist_moe.BlockScaledConfig | None = None,
+        wgrad_dtype: torch.dtype | None = None,
     ) -> tuple:
         """Create two input sets and one standalone DistMoE context.
 
@@ -2957,6 +2958,7 @@ class DistMoeKernelTest(unittest.TestCase):
             situ_glu_linear_beta: Up-projection tanh bound for SiTU-GLU.
             inference: Whether to create a scratch-only inference context.
             block_scaled: Optional block-scaled execution policy.
+            wgrad_dtype: Optional explicit weight-gradient output dtype.
 
         Returns:
             dist_moe.Context, two ``(x, topk_ids, topk_scores)`` tuples, and the two
@@ -3020,6 +3022,7 @@ class DistMoeKernelTest(unittest.TestCase):
                 swiglu_limit=swiglu_limit,
                 situ_glu_beta=situ_glu_beta,
                 situ_glu_linear_beta=situ_glu_linear_beta,
+                wgrad_dtype=wgrad_dtype,
                 inference=inference,
             ),
         )
@@ -3599,6 +3602,91 @@ class DistMoeKernelTest(unittest.TestCase):
                             rtol=0,
                             atol=0,
                         )
+
+    # The original benchmark shape needs more decoder programs than can run
+    # concurrently, exposing any illegal overlap between packed H2 and BF16 H2.
+    def test_nvfp4_staged_large_bf16_wgrad_graph_repeat_is_exact(self) -> None:
+        """Require large NVFP4 Staged BF16 WGRAD to replay bitwise exactly.
+
+        Eager and graph execution use identical operands and kernels, so this
+        comparison has no reference tolerance. The large decoder grid exposes
+        unsafe overlap that a fully concurrent small launch can hide.
+        """
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+            num_experts=8,
+            num_tokens=128,
+            hidden_dim=3584,
+            intermediate_dim=3072,
+            inference=False,
+            block_scaled=dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+                pipeline="staged",
+            ),
+            wgrad_dtype=torch.bfloat16,
+        )
+        x_TD, ids_TK, scores_TK = case_a
+        for tensor in (x_TD, scores_TK, w13_EFD, w2_EDF):
+            tensor.requires_grad_()
+        grad_TD = torch.randn_like(x_TD)
+        differentiable_inputs = (x_TD, scores_TK, w13_EFD, w2_EDF)
+
+        def step() -> torch.Tensor:
+            """Run one complete large NVFP4 Staged training invocation."""
+            for tensor in differentiable_inputs:
+                tensor.grad = None
+            output_TD = dist_moe.routed_experts(
+                x_TD,
+                ids_TK,
+                scores_TK,
+                w13_EFD,
+                w2_EDF,
+                context,
+            )
+            output_TD.backward(grad_TD)
+            return output_TD
+
+        for _ in range(2):
+            step()
+        torch.cuda.synchronize()
+        eager_output_TD = step().detach().clone()
+        eager_gradients = tuple(
+            tensor.grad.detach().clone() for tensor in differentiable_inputs
+        )
+
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            for _ in range(2):
+                step()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_output_TD = step()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            captured_output_TD,
+            eager_output_TD,
+            rtol=0,
+            atol=0,
+        )
+        for name, tensor, eager_gradient in zip(
+            ("x", "topk_scores", "w13", "w2"),
+            differentiable_inputs,
+            eager_gradients,
+            strict=True,
+        ):
+            self.assertIsNotNone(tensor.grad, f"missing {name} gradient")
+            torch.testing.assert_close(
+                tensor.grad,
+                eager_gradient,
+                rtol=0,
+                atol=0,
+                msg=lambda message, name=name: f"{name}: {message}",
+            )
 
     def test_nvfp4_bf16_weights_match_prepared_weights(self) -> None:
         """Compare dynamic BF16 weights with explicit NVFP4 preparation.
@@ -7124,6 +7212,154 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 self.assertEqual(len(preprocess_calls), 4)
                 self.assertEqual(prepare_weight.call_count, 4)
                 self.assertCountEqual(seen_wgrads, ["w13", "w2"])
+
+    # Mega exercises the same H2 regeneration after fused peer execution, so
+    # retain a real two-rank graph-replay check alongside the large Staged case.
+    @with_comms
+    def test_nvfp4_mega_bf16_wgrad_cuda_graph_repeat_is_exact(self) -> None:
+        """Require BF16 WGRAD to survive real peer CUDA-graph replay exactly.
+
+        The eager call and replay use identical operands and kernels, so this
+        comparison has no low-precision reference tolerance. It protects the
+        full-save H2 reconstruction and W2 gradient after peer execution.
+        """
+        rank = dist.get_rank()
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        num_tokens, hidden_dim, intermediate_dim = 128, 256, 256
+        num_experts, top_k = 4, 2
+        num_local_experts = num_experts // self.world_size
+
+        config = dist_moe.Config(
+            max_num_local_input_tokens=num_tokens,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            top_k=top_k,
+            num_experts=num_experts,
+            max_moe_layers_per_activation_slot=1,
+            num_activation_slots=1,
+            activation_slot_capacity_factor=1.0,
+            device_scratch_capacity_factor=1.0,
+            wgrad_dtype=torch.bfloat16,
+            block_scaled=dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+                pipeline="mega",
+            ),
+        )
+        context = dist_moe.create_context(
+            group=dist.group.WORLD,
+            config=config,
+            device=device,
+        )
+
+        torch.manual_seed(42 + rank)
+        x_TD = torch.randn(
+            num_tokens,
+            hidden_dim,
+            dtype=torch.bfloat16,
+            device=device,
+            requires_grad=True,
+        )
+        global_token_T = rank * num_tokens + torch.arange(
+            num_tokens,
+            device=device,
+        )
+        first_expert_T = global_token_T % num_experts
+        first_rank_T = first_expert_T // num_local_experts
+        first_local_expert_T = first_expert_T % num_local_experts
+        route_K = torch.arange(top_k, device=device)
+        ids_TK = (
+            first_rank_T[:, None] + route_K[None, :]
+        ) % self.world_size * num_local_experts + (
+            first_local_expert_T[:, None] + route_K[None, :] // self.world_size
+        ) % num_local_experts
+
+        scores_TK = torch.full(
+            (num_tokens, top_k),
+            1.0 / top_k,
+            device=device,
+            requires_grad=True,
+        )
+        w13_EFD = torch.randn(
+            num_local_experts,
+            2 * intermediate_dim,
+            hidden_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        w2_EDF = torch.randn(
+            num_local_experts,
+            hidden_dim,
+            intermediate_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        w13_EFD.mul_(hidden_dim**-0.5).requires_grad_()
+        w2_EDF.mul_(intermediate_dim**-0.5).requires_grad_()
+        grad_TD = torch.randn_like(x_TD)
+
+        differentiable_inputs = (x_TD, scores_TK, w13_EFD, w2_EDF)
+
+        def step() -> torch.Tensor:
+            """Run one complete NVFP4 training invocation."""
+            for tensor in differentiable_inputs:
+                tensor.grad = None
+            output_TD = dist_moe.routed_experts(
+                x_TD,
+                ids_TK,
+                scores_TK,
+                w13_EFD,
+                w2_EDF,
+                context,
+            )
+            output_TD.backward(grad_TD)
+            return output_TD
+
+        try:
+            for _ in range(10):
+                step()
+            torch.cuda.synchronize()
+            eager_output_TD = step().detach().clone()
+            eager_gradients = tuple(
+                tensor.grad.detach().clone() for tensor in differentiable_inputs
+            )
+
+            capture_stream = torch.cuda.Stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                for _ in range(10):
+                    step()
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured_output_TD = step()
+            dist.barrier()
+            graph.replay()
+
+            torch.testing.assert_close(
+                captured_output_TD,
+                eager_output_TD,
+                rtol=0,
+                atol=0,
+            )
+            for name, tensor, eager_gradient in zip(
+                ("x", "topk_scores", "w13", "w2"),
+                differentiable_inputs,
+                eager_gradients,
+                strict=True,
+            ):
+                self.assertIsNotNone(tensor.grad, f"missing {name} gradient")
+                torch.testing.assert_close(
+                    tensor.grad,
+                    eager_gradient,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda message, name=name: f"{name}: {message}",
+                )
+        finally:
+            context.close()
 
     @with_comms
     def test_nvfp4_post_expert_rmsnorm_backward_exercises_peer_paths(self) -> None:
