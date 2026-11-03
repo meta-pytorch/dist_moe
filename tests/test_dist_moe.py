@@ -1436,8 +1436,8 @@ class DistMoeConfigTest(unittest.TestCase):
                 fast_math=True,
             )
 
-    def test_nvfp4_requires_inference_and_aligned_dimensions(self) -> None:
-        """Reject NVFP4 training and shapes outside the kernel contract."""
+    def test_nvfp4_training_accepts_aligned_dimensions(self) -> None:
+        """Accept NVFP4 training while rejecting shapes outside its contract."""
         nvfp4 = dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4)
         common = {
             "max_num_local_input_tokens": 4,
@@ -1447,8 +1447,8 @@ class DistMoeConfigTest(unittest.TestCase):
             "max_moe_layers_per_activation_slot": 1,
             "block_scaled": nvfp4,
         }
-        with self.assertRaisesRegex(ValueError, "inference-only"):
-            dist_moe.Config(hidden_dim=256, **common)
+        config = dist_moe.Config(hidden_dim=256, **common)
+        self.assertFalse(config.inference)
         with self.assertRaisesRegex(ValueError, "multiple of 256"):
             dist_moe.Config(hidden_dim=128, inference=True, **common)
 
@@ -2168,49 +2168,6 @@ class DistMoeKernelTest(unittest.TestCase):
             torch.ones((rows, 1), dtype=torch.float32, device="cuda"),
         )
         expected = (inner_dequantized * global_scale_inv_M[:, None]).to(torch.bfloat16)
-        output_bytes = expected.numel() * expected.element_size()
-        activation_offset = 32
-        activation_buffer = torch.full(
-            (activation_offset + output_bytes + 32,),
-            0xA5,
-            dtype=torch.uint8,
-            device="cuda",
-        )
-        activation_offset_1 = torch.tensor(
-            [activation_offset],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        conditional_execution_1 = torch.zeros(
-            (1,),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        original_buffer = activation_buffer.clone()
-        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-            activation_buffer,
-            activation_offset_1,
-            conditional_execution_1,
-        )
-        self.assertTrue(torch.equal(activation_buffer, original_buffer))
-        conditional_execution_1.fill_(1)
-        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-            activation_buffer,
-            activation_offset_1,
-            conditional_execution_1,
-        )
-        buffered = (
-            activation_buffer[activation_offset : activation_offset + output_bytes]
-            .view(torch.bfloat16)
-            .view_as(expected)
-        )
-
         self.assertFalse(qdata_MQ.is_contiguous())
         self.assertFalse(scale_MB.is_contiguous())
         self.assertGreater(global_scale_inv_M.stride(0), 1)
@@ -2219,15 +2176,6 @@ class DistMoeKernelTest(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(blocked_actual.view(torch.uint16), expected.view(torch.uint16))
-        )
-        self.assertTrue(
-            torch.equal(buffered.view(torch.uint16), expected.view(torch.uint16))
-        )
-        self.assertTrue(torch.all(activation_buffer[:activation_offset] == 0xA5).item())
-        self.assertTrue(
-            torch.all(
-                activation_buffer[activation_offset + output_bytes :] == 0xA5
-            ).item()
         )
 
     def test_nvfp4_weight_dequantization_matches_gold(self) -> None:
@@ -2345,108 +2293,10 @@ class DistMoeKernelTest(unittest.TestCase):
                 ),
                 torch.empty(2, dtype=torch.float32, device="cuda"),
             )
-            blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-                torch.empty(
-                    7,
-                    136,
-                    dtype=torch.float4_e2m1fn_x2,
-                    device="cuda",
-                ),
-                torch.empty(
-                    7,
-                    17,
-                    dtype=torch.float8_e4m3fn,
-                    device="cuda",
-                ),
-                torch.empty(7, dtype=torch.float32, device="cuda"),
-                torch.empty(7 * 272 * 2, dtype=torch.uint8, device="cuda"),
-                torch.empty(1, dtype=torch.int64, device="cuda"),
-                torch.empty(1, dtype=torch.int32, device="cuda"),
-            )
-
         self.assertEqual(activation.shape, (7, 272))
         self.assertIs(activation.dtype, torch.bfloat16)
         self.assertEqual(weight.shape, (2, 129, 272))
         self.assertIs(weight.dtype, torch.bfloat16)
-
-    def test_nvfp4_activation_dequantization_graph_replays_device_state(self) -> None:
-        """Captured DQ follows replay-time activation offsets and predicates."""
-        rows, cols = 4, 256
-        generator = torch.Generator(device="cuda").manual_seed(20261029)
-        x = torch.randn(
-            rows,
-            cols,
-            dtype=torch.bfloat16,
-            device="cuda",
-            generator=generator,
-        )
-        qdata_MQ, scale_MB, global_scale_inv_M = (
-            blockscaled_impl._quantize_nvfp4_per_token(
-                x,
-                layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
-            )
-        )
-        expected = blockscaled_impl._dequantize_nvfp4_activation(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-        )
-        output_bytes = expected.numel() * expected.element_size()
-        first_offset = 32
-        second_offset = first_offset + output_bytes
-        activation_buffer = torch.full(
-            (second_offset + output_bytes + 32,),
-            0xA5,
-            dtype=torch.uint8,
-            device="cuda",
-        )
-        activation_offset_1 = torch.tensor(
-            [first_offset],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        conditional_execution_1 = torch.zeros(
-            (1,),
-            dtype=torch.int32,
-            device="cuda",
-        )
-
-        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-            activation_buffer,
-            activation_offset_1,
-            conditional_execution_1,
-        )
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-                qdata_MQ,
-                scale_MB,
-                global_scale_inv_M,
-                activation_buffer,
-                activation_offset_1,
-                conditional_execution_1,
-            )
-
-        activation_offset_1.fill_(second_offset)
-        conditional_execution_1.fill_(1)
-        graph.replay()
-        buffered = (
-            activation_buffer[second_offset : second_offset + output_bytes]
-            .view(torch.bfloat16)
-            .view_as(expected)
-        )
-
-        self.assertTrue(
-            torch.equal(buffered.view(torch.uint16), expected.view(torch.uint16))
-        )
-        self.assertTrue(
-            torch.all(
-                activation_buffer[first_offset : first_offset + output_bytes] == 0xA5
-            ).item()
-        )
 
     def test_nvfp4_token_scale_writes_directly_to_strided_output(self) -> None:
         """Dynamic NVFP4 quantization writes its inverse scale in place."""
@@ -3306,6 +3156,7 @@ class DistMoeKernelTest(unittest.TestCase):
         cases = (
             (dist_moe.BlockScaledFormat.MXFP8_E4M3, False),
             (dist_moe.BlockScaledFormat.MXFP8_E4M3, True),
+            (dist_moe.BlockScaledFormat.NVFP4, False),
             (dist_moe.BlockScaledFormat.NVFP4, True),
         )
         for block_format, inference in cases:
@@ -3383,7 +3234,7 @@ class DistMoeKernelTest(unittest.TestCase):
                         context.reset()
 
     def test_training_cuda_graph_matches_eager_forward_and_backward(self) -> None:
-        """Match BF16 and MXFP8 graph outputs and gradients to eager execution."""
+        """Match every training backend's graph outputs and gradients to eager."""
 
         def bind_run(
             context: dist_moe.Context,
@@ -3434,6 +3285,26 @@ class DistMoeKernelTest(unittest.TestCase):
                 None,
                 "swiglu",
             ),
+            (
+                "nvfp4_staged",
+                dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
+                    pipeline="staged",
+                ),
+                False,
+                None,
+                "swiglu",
+            ),
+            (
+                "nvfp4_mega",
+                dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
+                    pipeline="mega",
+                ),
+                False,
+                None,
+                "swiglu",
+            ),
             ("bf16_accumulate_bf16", None, True, torch.bfloat16, "swiglu"),
             ("bf16_accumulate_fp32", None, True, torch.float32, "swiglu"),
             (
@@ -3450,6 +3321,16 @@ class DistMoeKernelTest(unittest.TestCase):
                 "mxfp8_staged_accumulate_fp32",
                 dist_moe.BlockScaledConfig(
                     format=dist_moe.BlockScaledFormat.MXFP8_E4M3,
+                    pipeline="staged",
+                ),
+                True,
+                torch.float32,
+                "swiglu",
+            ),
+            (
+                "nvfp4_staged_accumulate_fp32",
+                dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
                     pipeline="staged",
                 ),
                 True,
@@ -3615,8 +3496,126 @@ class DistMoeKernelTest(unittest.TestCase):
                     )
                 torch.testing.assert_close(actual_TD, expected_TD, rtol=0, atol=0)
 
+    def test_nvfp4_training_backward_matches_fake_quant_reference(self) -> None:
+        """Match NVFP4 STE gradients for staged/Mega and save/recompute.
+
+        Relative-L2 bounds cover real tensor-core MMA versus the reference's
+        ``F.linear`` accumulation order. All four gradients are checked so W13
+        and W2 prove the saved X_bw and regenerated Q-DQ H2 operands,
+        respectively, while input DGRAD proves requantized/dequantized weights.
+        """
+        for pipeline in ("staged", "mega"):
+            policy = dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+                pipeline=pipeline,
+            )
+            base_context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                inference=False,
+                block_scaled=policy,
+            )
+            for force_recompute in (False, True):
+                with self.subTest(
+                    pipeline=pipeline,
+                    force_recompute=force_recompute,
+                ):
+                    context = base_context
+                    if force_recompute:
+                        base_config = dataclasses.replace(
+                            base_context.config,
+                            activation_slot_capacity_factor=None,
+                            activation_slot_bytes=None,
+                        )
+                        minimum = dist_moe.plan_memory(
+                            base_config,
+                            1,
+                            device=case_a[0].device,
+                        ).minimum_activation_slot_bytes
+                        context = dist_moe.create_context(
+                            group=dist.group.WORLD,
+                            config=dataclasses.replace(
+                                base_config,
+                                activation_slot_bytes=minimum,
+                            ),
+                        )
+                        self.addCleanup(context.close)
+
+                    x_TD, ids_TK, scores_TK = case_a
+                    actual = tuple(
+                        tensor.detach().clone().requires_grad_()
+                        for tensor in (x_TD, scores_TK, w13_EFD, w2_EDF)
+                    )
+                    reference = tuple(
+                        tensor.detach().clone().requires_grad_()
+                        for tensor in (x_TD, scores_TK, w13_EFD, w2_EDF)
+                    )
+                    actual_TD = dist_moe.routed_experts(
+                        actual[0],
+                        ids_TK,
+                        actual[1],
+                        actual[2],
+                        actual[3],
+                        context,
+                    )
+                    reference_TD = _reference_moe_nvfp4_fake_quant(
+                        reference[0],
+                        ids_TK,
+                        reference[1],
+                        reference[2],
+                        reference[3],
+                    )
+                    grad_TD = torch.randn_like(actual_TD)
+                    actual_TD.backward(grad_TD)
+                    reference_TD.backward(grad_TD)
+                    assert context.activation_buffer is not None
+                    self._assert_planner_reset(context.activation_buffer)
+
+                    self.assertLess(_relative_l2(actual_TD, reference_TD), 0.04)
+                    for actual_input, reference_input in zip(
+                        actual,
+                        reference,
+                        strict=True,
+                    ):
+                        self.assertIsNotNone(actual_input.grad)
+                        self.assertIsNotNone(reference_input.grad)
+                        assert actual_input.grad is not None
+                        assert reference_input.grad is not None
+                        self.assertLess(
+                            _relative_l2(
+                                actual_input.grad,
+                                reference_input.grad,
+                            ),
+                            0.04,
+                        )
+
+    def test_nvfp4_training_rejects_prepared_weights(self) -> None:
+        """Keep prepared NVFP4 operands inference-only after enabling training."""
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+        )
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+            inference=False,
+            block_scaled=policy,
+        )
+        prepared_w13 = dist_moe.prepare_block_scaled_weight(
+            w13_EFD,
+            policy,
+            inference=True,
+        )
+        prepared_w2 = dist_moe.prepare_block_scaled_weight(
+            w2_EDF,
+            policy,
+            inference=True,
+        )
+        with self.assertRaisesRegex(ValueError, "native BF16 weights"):
+            dist_moe.routed_experts(
+                *case_a,
+                prepared_w13,
+                prepared_w2,
+                context,
+            )
+
     def test_nvfp4_forward_saves_reference_backward_activations(self) -> None:
-        """Save dense Q-DQ inputs and real GEMM boundaries for future backward.
+        """Save dense Q-DQ inputs and real GEMM boundaries for backward.
 
         Staged and Mega must preserve their current output bitwise. The saved
         ``X_bw``, ``H1``, and ``H3`` are compared with the fake-quantized
@@ -5070,7 +5069,7 @@ class DistMoeKernelTest(unittest.TestCase):
         )
 
     def test_wgrad_accumulators_are_visible_to_joint_make_fx(self) -> None:
-        """BF16 and MXFP8 joint graphs expose both WGRAD destinations."""
+        """BF16 and block-scaled joint graphs expose both WGRAD destinations."""
         dist.init_process_group(
             backend="fake",
             store=dist.HashStore(),
@@ -5084,6 +5083,10 @@ class DistMoeKernelTest(unittest.TestCase):
                 dist_moe.BlockScaledConfig(
                     format=dist_moe.BlockScaledFormat.MXFP8_E4M3
                 ),
+                torch.ops.dist_moe.block_scaled_backward_accumulate_.default,
+            ),
+            (
+                dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4),
                 torch.ops.dist_moe.block_scaled_backward_accumulate_.default,
             ),
         )
@@ -5185,146 +5188,163 @@ class DistMoeKernelTest(unittest.TestCase):
             pipeline="mega",
         )
 
-    def test_mxfp8_training_context_no_grad_is_scratch_only(self) -> None:
+    def test_blockscaled_training_context_no_grad_is_scratch_only(self) -> None:
         """No-grad staged/Mega evaluation leaves training slot state untouched."""
-        for pipeline in ("staged", "mega"):
-            with self.subTest(pipeline=pipeline):
-                context, case_a, case_b, w13_EFD, w2_EDF = self._create_case(
-                    inference=False,
-                    block_scaled=dist_moe.BlockScaledConfig(pipeline=pipeline),
+        for block_format in (
+            dist_moe.BlockScaledFormat.MXFP8_E4M3,
+            dist_moe.BlockScaledFormat.NVFP4,
+        ):
+            for pipeline in ("staged", "mega"):
+                with self.subTest(block_format=block_format, pipeline=pipeline):
+                    self._assert_blockscaled_training_context_no_grad_is_scratch_only(
+                        block_format,
+                        pipeline,
+                    )
+
+    def _assert_blockscaled_training_context_no_grad_is_scratch_only(
+        self,
+        block_format: dist_moe.BlockScaledFormat,
+        pipeline: str,
+    ) -> None:
+        """Check one block-scaled training policy in no-grad and autograd."""
+        context, case_a, case_b, w13_EFD, w2_EDF = self._create_case(
+            inference=False,
+            block_scaled=dist_moe.BlockScaledConfig(
+                format=block_format,
+                pipeline=pipeline,
+            ),
+        )
+        x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+        for tensor in (x_TD, topk_scores_TK, w13_EFD, w2_EDF):
+            tensor.requires_grad_()
+        activation_buffer = context.activation_buffer
+        assert activation_buffer is not None
+        slot_state = tuple(
+            tensor.clone()
+            for tensor in (
+                activation_buffer.buffer_offsets,
+                activation_buffer.saved_activation_bytes_per_rank,
+                activation_buffer.moe_layer_id,
+            )
+        )
+
+        def run(
+            context: dist_moe.Context,
+            input_TD: torch.Tensor,
+            ids_TK: torch.Tensor,
+            scores_TK: torch.Tensor,
+            input_w13_EFD: torch.Tensor,
+            input_w2_EDF: torch.Tensor,
+        ) -> torch.Tensor:
+            """Run one block-scaled call through the public training context."""
+            return dist_moe.routed_experts(
+                input_TD,
+                ids_TK,
+                scores_TK,
+                input_w13_EFD,
+                input_w2_EDF,
+                context,
+            )
+
+        def assert_slot_state(
+            activation_buffer: ActivationBuffer,
+            slot_state: tuple[torch.Tensor, ...],
+        ) -> None:
+            """Require every activation-slot counter to remain unchanged."""
+            for actual, expected in zip(
+                (
+                    activation_buffer.buffer_offsets,
+                    activation_buffer.saved_activation_bytes_per_rank,
+                    activation_buffer.moe_layer_id,
+                ),
+                slot_state,
+                strict=True,
+            ):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        bound_run = partial(run, context)
+        bound_assert_slot_state = partial(
+            assert_slot_state,
+            activation_buffer,
+            slot_state,
+        )
+
+        with torch.no_grad():
+            eager_TD = bound_run(
+                x_TD,
+                topk_expert_ids_TK,
+                topk_scores_TK,
+                w13_EFD,
+                w2_EDF,
+            )
+            self.assertFalse(eager_TD.requires_grad)
+            bound_assert_slot_state()
+
+            traced = make_fx(bound_run)(
+                x_TD,
+                topk_expert_ids_TK,
+                topk_scores_TK,
+                w13_EFD,
+                w2_EDF,
+            )
+            custom_ops = [
+                node
+                for node in traced.graph.nodes
+                if node.op == "call_function"
+                and node.target is torch.ops.dist_moe.block_scaled_forward.default
+            ]
+            self.assertEqual(len(custom_ops), 1)
+            self.assertIs(custom_ops[0].args[-2], False)
+            traced_TD = traced(
+                x_TD,
+                topk_expert_ids_TK,
+                topk_scores_TK,
+                w13_EFD,
+                w2_EDF,
+            )
+            torch.testing.assert_close(traced_TD, eager_TD, rtol=0, atol=0)
+            bound_assert_slot_state()
+
+            static_inputs = tuple(tensor.detach().clone() for tensor in case_a)
+            static_w13_EFD = w13_EFD.detach().clone()
+            static_w2_EDF = w2_EDF.detach().clone()
+            bound_run(*static_inputs, static_w13_EFD, static_w2_EDF)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output_TD = bound_run(
+                    *static_inputs,
+                    static_w13_EFD,
+                    static_w2_EDF,
                 )
-                x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
-                for tensor in (x_TD, topk_scores_TK, w13_EFD, w2_EDF):
-                    tensor.requires_grad_()
-                activation_buffer = context.activation_buffer
-                assert activation_buffer is not None
-                slot_state = tuple(
-                    tensor.clone()
-                    for tensor in (
-                        activation_buffer.buffer_offsets,
-                        activation_buffer.saved_activation_bytes_per_rank,
-                        activation_buffer.moe_layer_id,
-                    )
+            for inputs in (case_a, case_b):
+                for static, value in zip(static_inputs, inputs, strict=True):
+                    static.copy_(value)
+                expected_TD = bound_run(
+                    *inputs,
+                    static_w13_EFD,
+                    static_w2_EDF,
                 )
-
-                def run(
-                    context: dist_moe.Context,
-                    input_TD: torch.Tensor,
-                    ids_TK: torch.Tensor,
-                    scores_TK: torch.Tensor,
-                    input_w13_EFD: torch.Tensor,
-                    input_w2_EDF: torch.Tensor,
-                ) -> torch.Tensor:
-                    """Run one MXFP8 call through the public training context."""
-                    return dist_moe.routed_experts(
-                        input_TD,
-                        ids_TK,
-                        scores_TK,
-                        input_w13_EFD,
-                        input_w2_EDF,
-                        context,
-                    )
-
-                def assert_slot_state(
-                    activation_buffer: ActivationBuffer,
-                    slot_state: tuple[torch.Tensor, ...],
-                ) -> None:
-                    """Require every activation-slot counter to remain unchanged."""
-                    for actual, expected in zip(
-                        (
-                            activation_buffer.buffer_offsets,
-                            activation_buffer.saved_activation_bytes_per_rank,
-                            activation_buffer.moe_layer_id,
-                        ),
-                        slot_state,
-                        strict=True,
-                    ):
-                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-                bound_run = partial(run, context)
-                bound_assert_slot_state = partial(
-                    assert_slot_state,
-                    activation_buffer,
-                    slot_state,
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    graph_output_TD,
+                    expected_TD,
+                    rtol=0,
+                    atol=0,
                 )
+                bound_assert_slot_state()
 
-                with torch.no_grad():
-                    eager_TD = bound_run(
-                        x_TD,
-                        topk_expert_ids_TK,
-                        topk_scores_TK,
-                        w13_EFD,
-                        w2_EDF,
-                    )
-                    self.assertFalse(eager_TD.requires_grad)
-                    bound_assert_slot_state()
-
-                    traced = make_fx(bound_run)(
-                        x_TD,
-                        topk_expert_ids_TK,
-                        topk_scores_TK,
-                        w13_EFD,
-                        w2_EDF,
-                    )
-                    custom_ops = [
-                        node
-                        for node in traced.graph.nodes
-                        if node.op == "call_function"
-                        and node.target
-                        is torch.ops.dist_moe.block_scaled_forward.default
-                    ]
-                    self.assertEqual(len(custom_ops), 1)
-                    self.assertIs(custom_ops[0].args[-2], False)
-                    traced_TD = traced(
-                        x_TD,
-                        topk_expert_ids_TK,
-                        topk_scores_TK,
-                        w13_EFD,
-                        w2_EDF,
-                    )
-                    torch.testing.assert_close(traced_TD, eager_TD, rtol=0, atol=0)
-                    bound_assert_slot_state()
-
-                    static_inputs = tuple(tensor.detach().clone() for tensor in case_a)
-                    static_w13_EFD = w13_EFD.detach().clone()
-                    static_w2_EDF = w2_EDF.detach().clone()
-                    bound_run(*static_inputs, static_w13_EFD, static_w2_EDF)
-                    torch.cuda.synchronize()
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        graph_output_TD = bound_run(
-                            *static_inputs,
-                            static_w13_EFD,
-                            static_w2_EDF,
-                        )
-                    for inputs in (case_a, case_b):
-                        for static, value in zip(static_inputs, inputs, strict=True):
-                            static.copy_(value)
-                        expected_TD = bound_run(
-                            *inputs,
-                            static_w13_EFD,
-                            static_w2_EDF,
-                        )
-                        graph.replay()
-                        torch.cuda.synchronize()
-                        torch.testing.assert_close(
-                            graph_output_TD,
-                            expected_TD,
-                            rtol=0,
-                            atol=0,
-                        )
-                        bound_assert_slot_state()
-
-                training_TD = bound_run(
-                    x_TD,
-                    topk_expert_ids_TK,
-                    topk_scores_TK,
-                    w13_EFD,
-                    w2_EDF,
-                )
-                torch.testing.assert_close(training_TD, eager_TD, rtol=0, atol=0)
-                training_TD.backward(torch.randn_like(training_TD))
-                self._assert_planner_reset(activation_buffer)
+        training_TD = bound_run(
+            x_TD,
+            topk_expert_ids_TK,
+            topk_scores_TK,
+            w13_EFD,
+            w2_EDF,
+        )
+        torch.testing.assert_close(training_TD, eager_TD, rtol=0, atol=0)
+        training_TD.backward(torch.randn_like(training_TD))
+        self._assert_planner_reset(activation_buffer)
 
     def test_inference_cuda_graphs_replay_bounded_shapes(self) -> None:
         """One context backs fixed CUDA graphs at multiple bounded T values."""
@@ -6022,6 +6042,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
         weight_block_size: Literal["1x32", "32x32"] | None = None,
         reference_moe: Callable[..., torch.Tensor] = _reference_moe,
         fwd_tolerance_override: tuple[float, float, float, float] | None = None,
+        grad_tolerance_override: tuple[float, float, float, float] | None = None,
     ) -> None:
         """Run one precision through real peer dispatch and combine paths.
 
@@ -6051,6 +6072,8 @@ class DistMoeTwoRankTest(unittest.TestCase):
             reference_moe: Routed reference implementation to compare against.
             fwd_tolerance_override: Optional rtol, atol, relative-L2, and cosine
                 bounds replacing the format defaults.
+            grad_tolerance_override: Optional rtol, atol, relative-L2, and
+                cosine bounds replacing every gradient format default.
         """
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
@@ -6058,10 +6081,6 @@ class DistMoeTwoRankTest(unittest.TestCase):
         num_tokens, hidden_dim, intermediate_dim = 128, 1024, 1024
         num_experts, top_k = 4, 2
         num_local_experts = num_experts // self.world_size
-        inference = inference or (
-            block_scaled is not None
-            and block_scaled.format is dist_moe.BlockScaledFormat.NVFP4
-        )
         prepared_weights = prepared_weights or inference
 
         # Every token selects one expert on each rank, forcing dispatch gather
@@ -6296,7 +6315,9 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 self.assertIsNotNone(
                     expected_grad, f"missing reference {name} gradient"
                 )
-                if block_scaled is None:
+                if grad_tolerance_override is not None:
+                    grad_tolerance = grad_tolerance_override
+                elif block_scaled is None:
                     grad_tolerance = (
                         3e-2,
                         1.0 if name in ("w13", "w2") else 3e-2,
@@ -6713,7 +6734,8 @@ class DistMoeTwoRankTest(unittest.TestCase):
         inference-only format.
         """
         self._run_two_rank_numerics(
-            dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4)
+            dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4),
+            inference=True,
         )
 
     @with_comms
@@ -6728,8 +6750,77 @@ class DistMoeTwoRankTest(unittest.TestCase):
         """
         self._run_two_rank_numerics(
             dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4),
+            inference=True,
             reference_moe=_reference_moe_nvfp4_fake_quant,
             fwd_tolerance_override=(0.01, 0.002, 0.025, 0.9997),
+        )
+
+    @with_comms
+    def test_nvfp4_forward_and_backward_exercise_peer_paths(self) -> None:
+        """Bound eager NVFP4 output and STE gradients over real peer paths."""
+        for pipeline in ("staged", "mega"):
+            with self.subTest(pipeline=pipeline):
+                preprocess_calls: list[torch.Size] = []
+                seen_wgrads: list[str] = []
+
+                def preprocess_weight(weight: torch.Tensor) -> torch.Tensor:
+                    """Record forward/backward weight materialization."""
+                    preprocess_calls.append(weight.shape)
+                    return weight
+
+                def record_wgrad(name: str, gradient: torch.Tensor) -> torch.Tensor:
+                    """Record and preserve each native BF16 weight gradient."""
+                    seen_wgrads.append(name)
+                    return gradient
+
+                with mock.patch.object(
+                    blockscaled_impl,
+                    "_prepare_blockscaled_weight_impl",
+                    wraps=blockscaled_impl._prepare_blockscaled_weight_impl,
+                ) as prepare_weight:
+                    self._run_two_rank_numerics(
+                        dist_moe.BlockScaledConfig(
+                            format=dist_moe.BlockScaledFormat.NVFP4,
+                            pipeline=pipeline,
+                        ),
+                        options=dist_moe.ExecutionOptions(
+                            weights_preprocess_fn=preprocess_weight,
+                            wgrad_postprocess_fn=record_wgrad,
+                        ),
+                        reference_moe=_reference_moe_nvfp4_fake_quant,
+                        fwd_tolerance_override=(0.02, 0.004, 0.04, 0.999),
+                        grad_tolerance_override=(0.2, 0.04, 0.04, 0.999),
+                    )
+                self.assertEqual(len(preprocess_calls), 4)
+                self.assertEqual(prepare_weight.call_count, 4)
+                self.assertCountEqual(seen_wgrads, ["w13", "w2"])
+
+    @with_comms
+    def test_nvfp4_post_expert_rmsnorm_backward_exercises_peer_paths(self) -> None:
+        """Differentiate fused RMSNorm after real two-rank NVFP4 compute."""
+        eps = 1e-6
+
+        def reference_rmsnorm(h3_KD: torch.Tensor) -> torch.Tensor:
+            """Apply the unfused FP32 RMSNorm reference to each route."""
+            return F.rms_norm(h3_KD.float(), (h3_KD.shape[-1],), eps=eps)
+
+        self._run_two_rank_numerics(
+            dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+            ),
+            options=dist_moe.ExecutionOptions(
+                experts_output_postprocess=dist_moe.RMSNormPostprocess(
+                    eps=eps,
+                    norm_output_dtype=torch.float32,
+                    output_dtype=torch.bfloat16,
+                    require_bitwise=False,
+                    recompute_rstd=True,
+                ),
+            ),
+            reference_moe=_reference_moe_nvfp4_fake_quant,
+            reference_postprocess_fn=reference_rmsnorm,
+            fwd_tolerance_override=(0.02, 0.004, 0.04, 0.999),
+            grad_tolerance_override=(0.2, 0.04, 0.05, 0.998),
         )
 
     @with_comms

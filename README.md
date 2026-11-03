@@ -31,13 +31,14 @@ graph-stable PyTorch operations needed to execute routed experts.
 | --- | --- | :---: | :---: |
 | BF16 | Standard | Yes | Yes |
 | MXFP8 E4M3 | Staged or Mega | Yes | Yes |
-| NVFP4 | Staged or Mega | No | Yes |
+| NVFP4 | Staged or Mega | Yes | Yes |
 
 All supported modes work with non-strict `make_fx`, CUDA graphs, and optional
 VMM host-backed scratch. Training modes include forward and backward.
 
-The package also supports native BF16 or prepared NVFP4 inference weights,
-prepared MXFP8 weights, device-selected activation slots, plain and clamped
+The package also supports NVFP4 training with native BF16 weights, native
+BF16 or prepared NVFP4 inference weights, prepared MXFP8 weights,
+device-selected activation slots, plain and clamped
 SwiGLU, BF16 SiTU-GLU, fused post-expert RMSNorm, clip statistics, and optional
 in-place accumulation into standard `parameter.grad` buffers.
 
@@ -45,7 +46,7 @@ in-place accumulation into standard `parameter.grad` buffers.
 <summary>Not supported in this release</summary>
 
 Full `torch.compile`, strict export, TLX or hierarchical execution,
-synchronous block-scaled backends, MXFP8 E5M2, MXFP4, A8W4, NVFP4 training,
+synchronous block-scaled backends, MXFP8 E5M2, MXFP4, A8W4,
 expert borrowing, activation rings, and communication quantization.
 
 </details>
@@ -355,9 +356,12 @@ Block-scaled SiTU-GLU is not yet supported.
 
 ### NVFP4
 
-NVFP4 is inference-only. It requires `Config(inference=True)`, zero activation
-slots, and prepared weights. The complete
-[NVFP4 inference example](examples/block_scaled_inference.py) runs with:
+NVFP4 supports training with native BF16 weights and inference with native
+BF16 or explicitly prepared weights. Training quantizes weights for forward,
+requantizes and dequantizes them for the BF16 backward, and uses STE
+semantics across the quantization boundaries. The complete
+[NVFP4 execution guide](docs/nvfp4_execution.md) describes both modes.
+The inference example runs with:
 
 ```bash
 torchrun --standalone --local-addr=127.0.0.1 --nproc-per-node=2 examples/block_scaled_inference.py
@@ -381,7 +385,8 @@ config = dist_moe.Config(
 )
 ```
 
-See [NVFP4 inference](docs/nvfp4_execution.md).
+For training, set `inference=False`, reserve at least one activation slot, pass
+native BF16 weights, and call `backward()` as in the BF16 quickstart.
 
 <a id="plan-memory"></a>
 ## Plan memory
@@ -544,7 +549,8 @@ and scales. Prepared execution can use logical sources without readable
 storage; see [weight ownership and reuse](docs/mxfp8_execution.md#prepare-and-reuse-weights).
 NVFP4 inference also accepts native BF16 W13 and W2 weights and quantizes them
 during each invocation. Preparing NVFP4 weights explicitly avoids that
-repeated work and remains the reusable inference API.
+repeated work and remains the reusable inference API. NVFP4 training requires
+native BF16 weights; it quantizes them in forward and again in backward.
 The complete
 [block-scaled inference example](examples/block_scaled_inference.py)
 prepares both expert weights before execution:
@@ -589,7 +595,7 @@ Training integrations may refill compatible prepared MXFP8 storage with the
 storage tensors and returns a wrapper associated with the current source weight.
 
 See [MXFP8 execution](docs/mxfp8_execution.md) and
-[NVFP4 inference](docs/nvfp4_execution.md) for format-specific fields.
+[NVFP4 execution](docs/nvfp4_execution.md) for format-specific fields.
 
 ### In-place WGRAD accumulation
 
@@ -755,7 +761,7 @@ device capacity may use host backing. See [VMM host-backed scratch](docs/vmm.md)
 | [`dist_moe.MemoryPlan`](docs/memory_planner.md) / [`dist_moe.plan_memory`](docs/memory_planner.md) | Immutable memory plan and pure planning function |
 | [`dist_moe.Context`](docs/bf16_execution.md) / [`dist_moe.create_context`](docs/bf16_execution.md) | Reusable distributed runtime state and collective factory |
 | [`dist_moe.PreparedWeight`](docs/mxfp8_execution.md) / [`dist_moe.prepare_block_scaled_weight`](docs/mxfp8_execution.md) | Caller-owned block-scaled weight storage and preparation |
-| [`dist_moe.routed_experts`](docs/bf16_execution.md) | BF16/MXFP8 training or BF16/MXFP8/NVFP4 inference |
+| [`dist_moe.routed_experts`](docs/bf16_execution.md) | BF16/MXFP8/NVFP4 training or inference |
 | [`dist_moe.supports_fused_post_expert_rmsnorm`](docs/postprocess.md) | Query fused RMSNorm shape/dtype support |
 
 The API docstrings are authoritative for individual arguments and validation
@@ -768,7 +774,7 @@ Start with the execution guide for the selected precision:
 
 - [BF16 end-to-end execution](docs/bf16_execution.md)
 - [Asynchronous MXFP8 end-to-end execution](docs/mxfp8_execution.md)
-- [NVFP4 inference execution](docs/nvfp4_execution.md)
+- [NVFP4 execution](docs/nvfp4_execution.md)
 
 Then use the focused guides as needed:
 

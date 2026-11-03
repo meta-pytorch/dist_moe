@@ -251,17 +251,18 @@ class PreparedWeight:
 
     Args:
         source: Logical high-precision weight identity. It receives WGRAD for
-            training formats; inference-only formats retain it only for
-            ownership and lifecycle coordination. Prepared execution does not
-            require readable source storage; Python preprocessing callbacks
-            that read the source still require it.
+            trainable prepared formats; inference-only prepared operands retain
+            it only for ownership and lifecycle coordination. Prepared
+            execution does not require readable source storage; Python
+            preprocessing callbacks that read the source still require it.
         format: Block-scaled format used by every quantized operand.
         fprop_data: Format-specific contiguous CUDA FPROP qdata. MXFP8 stores
             E4M3 values; NVFP4 stores two packed E2M1 values per byte.
         fprop_scale: Contiguous CUDA scale storage in the blocked layout
             consumed directly by the FPROP kernel.
         dgrad_data: Contiguous transposed MXFP8 E4M3 DGRAD qdata. It is required
-            for MXFP8 training and absent for inference-only NVFP4.
+            for MXFP8 training and absent for prepared NVFP4, which is
+            inference-only.
         dgrad_scale: Contiguous blocked DGRAD scales with the orientation
             matching ``dgrad_data``; absent for NVFP4.
         global_scale: Optional per-expert FP32 global scale required by NVFP4.
@@ -306,8 +307,8 @@ class PreparedWeight:
 
         Args:
             source: Logical high-precision weight identity. Training formats
-                use it as the WGRAD owner; inference-only formats retain it for
-                ownership and lifecycle coordination.
+                use it as the WGRAD owner; inference-only prepared operands
+                retain it for ownership and lifecycle coordination.
             format: Public block-scaled format shared by all operands.
             fprop_data: Quantized forward weight data.
             fprop_scale: Forward-oriented scale storage.

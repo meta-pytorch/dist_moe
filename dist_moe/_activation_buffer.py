@@ -2362,6 +2362,7 @@ def _get_blockscaled_backward_plan(
         peak_min_free_space_ptr=buffer_status.peak_min_free_space,
         need_recompute_ptr=forward_plan.need_recompute,
         fwd_x_offset_ptr=forward_plan.x_offset,
+        fwd_x_gathered_offset_ptr=forward_plan.x_gathered_offset,
         fwd_h1_offset_ptr=forward_plan.h1_offset,
         fwd_x_col_offset_ptr=fwd_bs.x_col_offset,
         fwd_h2_col_offset_ptr=fwd_bs.h2_col_offset,
@@ -2389,11 +2390,12 @@ def _get_blockscaled_backward_plan(
         moe_layer_id_ptr=buffer_status.moe_layer_id,
         mega=model_config.mega,
         native_backward=model_config.native_backward,
+        save_dequantized_activations=model_config.save_dequantized_activations,
     )
     # chunks are ordered as the kernel stores them into bwd_offsets_ptr. Of the
-    # dense BackwardPlan slots (0..5) only h1 (1) and grad_h2 (3) carry real
-    # offsets; x_gathered (0), h2 (2), grad_h3_gathered (4) and grad_h1 (5) are
-    # zero because block-scaling replaces them with the bundles in slots 6..13.
+    # The dequantized-activation mode populates every dense slot for the shared
+    # BF16 backward. Other block-scaled modes use only h1 (1) and grad_h2 (3);
+    # bundles in slots 6..13 replace the remaining dense operands.
     chunks = offsets.chunk(_BLOCKSCALED_BACKWARD_PLAN_OFFSET_COUNT)
     return BackwardPlan(
         x_gathered_offset=chunks[0],

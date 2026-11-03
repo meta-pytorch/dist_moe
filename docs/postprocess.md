@@ -286,7 +286,8 @@ CUDA graphs replay fixed kernels and stable activation/communication-buffer addr
 ## Check supported combinations
 
 - BF16 and MXFP8 training: scalarless fused RMSNorm with forward/backward.
-- BF16, MXFP8, and NVFP4 inference: scalarless or input-scale gamma RMSNorm.
+- BF16, MXFP8, and NVFP4: scalarless RMSNorm.
+- Inference/forward-only execution also accepts input-scale gamma RMSNorm.
 - Staged and Mega block-scaled execution: the same typed policy and output
   semantics.
 - Arbitrary callables and observers: eager only.

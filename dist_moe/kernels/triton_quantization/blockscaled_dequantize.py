@@ -211,6 +211,79 @@ def _dequantize_nvfp4_gather_kernel(
     )
 
 
+@triton.jit
+def _dequantize_nvfp4_activation_buffer_kernel(
+    activation_buffer_ptr,
+    qdata_offset_ptr,
+    scale_offset_ptr,
+    num_rows_ptr,
+    output_offset_ptr,
+    condition_ptr,
+    n_cols,
+    EXECUTE_WHEN_ZERO: tl.constexpr,
+    ROW_SCALE_STORAGE_MULTIPLE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Decode one planner-owned row bundle into planner-owned BF16 storage."""
+    condition = tl.load(condition_ptr, eviction_policy="evict_last")
+    should_execute = condition == 0 if EXECUTE_WHEN_ZERO else condition != 0
+    if not should_execute:
+        return
+
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    num_rows = tl.load(num_rows_ptr, eviction_policy="evict_last").to(tl.int64)
+    valid = (row.to(tl.int64) < num_rows) & (cols < n_cols)
+    row_i64 = row.to(tl.int64)
+    cols_i64 = cols.to(tl.int64)
+    qdata_offset = tl.load(qdata_offset_ptr, eviction_policy="evict_last").to(tl.int64)
+    scale_offset = tl.load(scale_offset_ptr, eviction_policy="evict_last").to(tl.int64)
+    qdata = (activation_buffer_ptr + qdata_offset).to(tl.pointer_type(tl.uint8))
+    packed = tl.load(
+        qdata + row_i64 * (n_cols // 2) + cols_i64 // 2,
+        mask=valid,
+        other=0,
+    )
+    code = tl.where((cols & 1) == 0, packed & 0xF, packed >> 4)
+    values = _decode_fp4_e2m1(code)
+
+    scale_cols = n_cols // 16
+    scales = (activation_buffer_ptr + scale_offset).to(tl.pointer_type(tl.float8e4nv))
+    n_col_blocks = (scale_cols + _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM - 1) // (
+        _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
+    )
+    inner_scale = tl.load(
+        scales
+        + _cublas_blocked_scale_offset(
+            row,
+            cols // 16,
+            n_col_blocks,
+        ).to(tl.int64),
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    global_scale_offset = (
+        scale_offset + num_rows * ROW_SCALE_STORAGE_MULTIPLE * scale_cols
+    )
+    global_scale_inv = tl.load(
+        (activation_buffer_ptr + global_scale_offset).to(tl.pointer_type(tl.float32))
+        + row_i64,
+        mask=row_i64 < num_rows,
+        other=0.0,
+    ).to(tl.float32)
+
+    output_offset = tl.load(
+        output_offset_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    output = (activation_buffer_ptr + output_offset).to(tl.pointer_type(tl.bfloat16))
+    tl.store(
+        output + row_i64 * n_cols + cols_i64,
+        values * inner_scale * global_scale_inv,
+        mask=valid,
+    )
+
+
 def dequantize_nvfp4(
     qdata: torch.Tensor,
     scale: torch.Tensor,
@@ -277,68 +350,6 @@ def dequantize_nvfp4(
     return output
 
 
-def dequantize_nvfp4_to_activation_buffer(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    global_scale_inv: torch.Tensor,
-    activation_buffer: torch.Tensor,
-    activation_offset: torch.Tensor,
-    condition: torch.Tensor,
-    *,
-    scale_layout: ScaleFactorLayoutId,
-) -> None:
-    """Conditionally dequantize activation rows to an offset-backed BF16 region.
-
-    Args:
-        qdata: Rank-two packed E2M1 rows. Strided rows are supported.
-        scale: Natural or CUBLAS-blocked E4M3 scales.
-        global_scale_inv: FP32 inverse outer scale for each row.
-        activation_buffer: Planner-owned one-dimensional byte storage.
-        activation_offset: One-element int64 device byte offset.
-        condition: One-element bool or int32 device predicate.
-        scale_layout: Physical layout of ``scale``.
-    """
-    rows, q_cols = qdata.shape
-    n_cols = q_cols * 2
-    if rows == 0 or n_cols == 0:
-        return
-
-    scale_cols = triton.cdiv(n_cols, 16)
-    n_col_blocks = triton.cdiv(scale_cols, CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM)
-    padded_rows = (
-        triton.cdiv(rows, CUBLAS_BLOCKED_ROWS_PER_ATOM) * CUBLAS_BLOCKED_ROWS_PER_ATOM
-    )
-    group_scale_elements = (
-        padded_rows * n_col_blocks * CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
-    )
-    scale_row_stride = (
-        scale.stride(0) if scale_layout == ScaleFactorLayoutId.NATURAL else 0
-    )
-    grid = (rows, triton.cdiv(n_cols, _BLOCK_SIZE))
-    _dequantize_nvfp4_kernel[grid](
-        qdata.view(torch.uint8),
-        scale,
-        global_scale_inv,
-        activation_buffer,
-        activation_buffer,
-        activation_offset,
-        condition,
-        qdata.stride(0),
-        scale_row_stride,
-        global_scale_inv.stride(0),
-        rows,
-        group_scale_elements,
-        n_col_blocks,
-        n_cols,
-        SCALE_LAYOUT=scale_layout.value,
-        OUTER_SCALE_PER_ROW=True,
-        WRITE_ACTIVATION_BUFFER=True,
-        HAS_CONDITION=True,
-        BLOCK_SIZE=_BLOCK_SIZE,
-        num_warps=4,
-    )
-
-
 def dequantize_gathered_nvfp4_to_activation_buffer(
     gather_ptrs: torch.Tensor,
     num_rows: torch.Tensor,
@@ -371,6 +382,51 @@ def dequantize_gathered_nvfp4_to_activation_buffer(
         condition,
         n_cols,
         EXECUTE_WHEN_ZERO=execute_when_zero,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        num_warps=4,
+    )
+
+
+def dequantize_nvfp4_activation_buffer_to_activation_buffer(
+    activation_buffer: torch.Tensor,
+    qdata_offset: torch.Tensor,
+    scale_offset: torch.Tensor,
+    num_rows: torch.Tensor,
+    output_offset: torch.Tensor,
+    condition: torch.Tensor,
+    *,
+    capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool,
+    row_scale_storage_multiple: int,
+) -> None:
+    """Dequantize one offset-backed NVFP4 row bundle into BF16 storage.
+
+    Args:
+        activation_buffer: Planner-owned byte-addressed allocation.
+        qdata_offset: Device scalar byte offset of packed E2M1 rows.
+        scale_offset: Device scalar byte offset of CUBLAS-blocked E4M3 scales.
+        num_rows: Device scalar containing the valid padded-row count.
+        output_offset: Device scalar byte offset of the BF16 destination.
+        condition: Device predicate selecting this operation.
+        capacity_rows: Static maximum row count used for graph-stable launch.
+        n_cols: Logical BF16 feature width.
+        execute_when_zero: Whether a zero predicate selects this operation.
+        row_scale_storage_multiple: Physical row-scale padding multiplier.
+    """
+    if capacity_rows == 0 or n_cols == 0:
+        return
+    grid = (capacity_rows, triton.cdiv(n_cols, _BLOCK_SIZE))
+    _dequantize_nvfp4_activation_buffer_kernel[grid](
+        activation_buffer,
+        qdata_offset,
+        scale_offset,
+        num_rows,
+        output_offset,
+        condition,
+        n_cols,
+        EXECUTE_WHEN_ZERO=execute_when_zero,
+        ROW_SCALE_STORAGE_MULTIPLE=row_scale_storage_multiple,
         BLOCK_SIZE=_BLOCK_SIZE,
         num_warps=4,
     )

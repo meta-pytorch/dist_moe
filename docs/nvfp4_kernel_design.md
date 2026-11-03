@@ -1,7 +1,7 @@
-# NVFP4 Inference Kernel Design
+# NVFP4 Kernel Design
 
 This guide explains the packed NVFP4 representation and the GPU kernels that
-consume it. Read [NVFP4 inference execution](nvfp4_execution.md) first for the
+consume it. Read [NVFP4 execution](nvfp4_execution.md) first for the
 public API and end-to-end lifetime model.
 The [memory planner](memory_planner.md) defines the hard routing and physical
 scratch bounds; this guide explains the kernel views inside that allocation.
@@ -21,10 +21,10 @@ scratch bounds; this guide explains the kernel views inside that allocation.
 <a id="supported-surface"></a>
 ## Supported surface
 
-NVFP4 is inference-only.
-`dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4)` requires
-`dist_moe.Config(inference=True)`. Autograd, WGRAD, DGRAD, and training
-recomputation are rejected.
+NVFP4 supports Staged and Mega forward for training and inference. Training
+uses native BF16 weights and delegates its gradient sequence to the BF16
+kernels after reconstructing exact dequantized forward operands. Prepared
+weights and interleaved W13 remain inference-only.
 
 The format stores:
 
@@ -45,11 +45,16 @@ separate MMA epilogue inputs, not replacements for the per-16-value scales.
 NVFP4 execution accepts native BF16 or explicitly prepared weights. Native
 weights are converted to packed FPROP qdata and CUBLAS-blocked scales during
 every invocation. Explicit preparation creates the same operands once.
-Because NVFP4 is inference-only, the prepared object does not allocate DGRAD
-qdata or scales. It retains both the per-expert global scale and its
+The inference-only prepared object does not allocate DGRAD qdata or scales.
+It retains both the per-expert global scale and its
 reciprocal. The runtime consumes the reciprocal directly, so prepared eager
 execution and CUDA graph replay do not launch quantization or a reciprocal
 kernel on every invocation.
+
+Training accepts only native BF16 weights. Forward quantizes them for FPROP.
+Backward quantizes them again, decodes packed E2M1 data and CUBLAS-blocked
+E4M3 scales with the per-expert inverse global scale, and supplies BF16
+`DQ(Q(W13))` and `DQ(Q(W2))` to native DGRAD. Packed weights are not saved.
 
 The default W13 rows concatenate gate and up projections for both staged and
 Mega execution. Opt-in `fuse_swiglu=True` preparation is restricted to Mega
@@ -64,9 +69,10 @@ the source topology restrictions below still apply.
 <a id="publish-source-rows"></a>
 ## Publish source rows
 
-Training MXFP8 publishes BF16 and quantizes after peer gather. NVFP4 inference
-quantizes on the source rank before publication to reduce symmetric-memory and
-peer-fabric traffic. `_stage_blockscaled_dispatch` writes each row as:
+Training MXFP8 publishes BF16 and quantizes after peer gather. NVFP4 quantizes
+on the source rank before publication to reduce symmetric-memory and
+peer-fabric traffic in both modes. `_stage_blockscaled_dispatch` writes each
+row as:
 
 ```text
 [packed E2M1 qdata | natural E4M3 block scales | FP32 inverse global scale]
@@ -108,7 +114,7 @@ The shared `blockscaled_gemm_tiles` helpers build qdata/scale TMA operands;
 the matching distributed and Mega entrypoint modules pass the complete
 problem and pipeline records to `gemm_warp_roles` and the tile scheduler.
 Those components share one descriptor, layout, and readiness contract rather
-than maintaining separate inference arithmetic.
+than maintaining separate training and inference arithmetic.
 
 <a id="interleaved-mega-inference"></a>
 ## Interleaved Mega inference
@@ -179,6 +185,11 @@ operands lie in device-backed sections. There is no public descriptor/storage
 selector or per-operand VMM mapping policy. None of these inference views
 creates saved activation state, and concat remains the default weight layout.
 
+Training always uses GPU-planned offsets. Its hybrid layout combines dense
+BF16 saved operands with transient packed NVFP4 row bundles. Full-save retains
+`DQ(Q(X_gathered))`, H1, and H3; recompute retains local BF16 X. The row-bundle
+decoder converts Q(X) and Q(H2) before their scratch is reused.
+
 G8 with GPU offsets requires the source high-throughput producer topology.
 Its padded allocation row bound is at least `16 * num_sms`, and the
 `(D, F) = (4096, 4096)` square shape is excluded. The narrow topology lacks the
@@ -216,21 +227,23 @@ Before shared epilogue storage is reused, the issuing warp drains pending TMA
 store reads with `cp_async_bulk_wait_group(0, read=True)` and the epilogue
 writers synchronize. This protects the shared-memory lifetime; it is distinct
 from peer publication and is not an overlap measurement. The common Mega
-backward [lane-parallel WGRAD readiness protocol](mxfp8_kernel_design.md#quantization-readiness)
-belongs to MXFP8 training, not to NVFP4's supported surface.
+backward
+[lane-parallel WGRAD readiness protocol](mxfp8_kernel_design.md#quantization-readiness)
+belongs to MXFP8 training. NVFP4 uses native BF16 DGRAD/WGRAD after operand
+reconstruction instead.
 
 <a id="compare-with-mxfp8"></a>
 ## Compare with MXFP8
 
-| Property | MXFP8 training | NVFP4 inference |
+| Property | MXFP8 training | NVFP4 training |
 | --- | --- | --- |
 | qdata | E4M3, one byte/value | E2M1, two values/byte |
 | block scale | E8M0 per 32 values | E4M3 per 16 values |
 | row global scale | none | FP32 inverse per activation row |
 | expert global scale | none | FP32 per expert weight tensor |
 | dispatch traffic | BF16 source rows | packed qdata + scales |
-| backward | staged and Mega | unsupported |
-| activation buffer | saved state + scratch | scratch only |
+| backward | block-scaled staged or Mega | native BF16 kernels |
+| activation buffer | quantized saved state + scratch | dense saved state + packed scratch |
 
 <a id="preserve-numerical-and-layout-invariants"></a>
 ## Preserve numerical and layout invariants

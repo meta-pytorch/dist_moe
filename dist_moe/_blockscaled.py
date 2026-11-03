@@ -22,6 +22,7 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode
 from . import _blockscaled_ops as dist_bs_gemm
 from ._activation_buffer import (
     ActivationBuffer,
+    BackwardPlan,
     BLOCKSCALED_DISPATCH_ROW_ALIGNMENT_BYTES,
     BlockscaledForwardPlan,
     BlockscaledStorageConfig,
@@ -33,6 +34,8 @@ from ._activation_buffer import (
     validate_buffer_capacity,
 )
 from ._activation_buffer_offsets import (
+    ACTIVATION_A_Q_OFFSET,
+    ACTIVATION_A_SCALE_OFFSET,
     activation_buffer_placeholder as _activation_buffer_placeholder,
     validate_activation_buffer_storage,
     validate_conditional_execution,
@@ -56,6 +59,7 @@ from ._buffers import (
 )
 from ._context import _get_context, _reshape_weights
 from ._execution import (
+    ExecutionOptions,
     _KernelAutogradContext,
     _postprocess_wgrad,
     _resolve_parameter_grad_destinations,
@@ -424,104 +428,6 @@ def _validate_nvfp4_activation_buffer_metadata(
     validate_conditional_execution(conditional_execution_1, device=device)
 
 
-@torch.library.custom_op(
-    "dist_moe::dequantize_nvfp4_activation_to_buffer_",
-    mutates_args=("activation_buffer",),
-)
-def _dequantize_nvfp4_activation_to_buffer(
-    qdata_MQ: torch.Tensor,
-    scale_MB: torch.Tensor,
-    global_scale_inv_M: torch.Tensor,
-    activation_buffer: torch.Tensor,
-    activation_offset_1: torch.Tensor,
-    conditional_execution_1: torch.Tensor,
-    blocked_scales: bool = False,
-) -> None:
-    """Conditionally dequantize an activation into planner-owned BF16 storage.
-
-    The destination offset and execution predicate stay on device, so a graph
-    replay can follow a new activation-checkpoint decision without host flow.
-
-    Args:
-        qdata_MQ: Packed E2M1 data with shape ``[M, K / 2]``.
-        scale_MB: Natural or CUBLAS-blocked per-16-value E4M3 scales.
-        global_scale_inv_M: Per-token inverse outer scales with shape ``[M]``.
-        activation_buffer: Planner-owned one-dimensional byte storage.
-        activation_offset_1: One-element int64 device byte offset.
-        conditional_execution_1: One-element bool or int32 device predicate.
-        blocked_scales: Whether ``scale_MB`` uses CUBLAS-blocked layout.
-    """
-    rows, cols = _validate_nvfp4_activation_dequantization(
-        qdata_MQ,
-        scale_MB,
-        global_scale_inv_M,
-        blocked_scales,
-    )
-    _validate_nvfp4_activation_buffer_metadata(
-        activation_buffer,
-        activation_offset_1,
-        conditional_execution_1,
-        device=qdata_MQ.device,
-        required_bytes=rows * cols * torch.bfloat16.itemsize,
-    )
-    validate_activation_buffer_storage(activation_buffer)
-
-    from .kernels.triton_quantization.blockscaled_dequantize import (
-        dequantize_nvfp4_to_activation_buffer,
-    )
-    from .kernels.triton_quantization.formats import ScaleFactorLayoutId
-
-    dequantize_nvfp4_to_activation_buffer(
-        qdata_MQ,
-        scale_MB,
-        global_scale_inv_M,
-        activation_buffer,
-        activation_offset_1,
-        conditional_execution_1,
-        scale_layout=(
-            ScaleFactorLayoutId.CUBLAS_BLOCKED
-            if blocked_scales
-            else ScaleFactorLayoutId.NATURAL
-        ),
-    )
-
-
-@_dequantize_nvfp4_activation_to_buffer.register_fake
-def _dequantize_nvfp4_activation_to_buffer_fake(
-    qdata_MQ: torch.Tensor,
-    scale_MB: torch.Tensor,
-    global_scale_inv_M: torch.Tensor,
-    activation_buffer: torch.Tensor,
-    activation_offset_1: torch.Tensor,
-    conditional_execution_1: torch.Tensor,
-    blocked_scales: bool = False,
-) -> None:
-    """Validate fake metadata for offset-backed activation dequantization.
-
-    Args:
-        qdata_MQ: Packed E2M1 data with shape ``[M, K / 2]``.
-        scale_MB: Natural or CUBLAS-blocked per-16-value E4M3 scales.
-        global_scale_inv_M: Per-token inverse outer scales with shape ``[M]``.
-        activation_buffer: Fake planner-owned byte storage.
-        activation_offset_1: Fake one-element int64 device byte offset.
-        conditional_execution_1: Fake one-element device predicate.
-        blocked_scales: Whether ``scale_MB`` uses CUBLAS-blocked layout.
-    """
-    rows, cols = _validate_nvfp4_activation_dequantization(
-        qdata_MQ,
-        scale_MB,
-        global_scale_inv_M,
-        blocked_scales,
-    )
-    _validate_nvfp4_activation_buffer_metadata(
-        activation_buffer,
-        activation_offset_1,
-        conditional_execution_1,
-        device=qdata_MQ.device,
-        required_bytes=rows * cols * torch.bfloat16.itemsize,
-    )
-
-
 def _validate_nvfp4_gather_dequantization(
     gather_ptrs_M: torch.Tensor,
     num_rows_1: torch.Tensor,
@@ -642,6 +548,127 @@ def _dequantize_gathered_nvfp4_activation_to_buffer_fake(
         activation_buffer,
         activation_offset_1,
         conditional_execution_1,
+        n_cols,
+    )
+
+
+def _validate_nvfp4_activation_buffer_dequantization(
+    activation_buffer: torch.Tensor,
+    qdata_offset_1: torch.Tensor,
+    scale_offset_1: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    output_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    capacity_rows: int,
+    n_cols: int,
+) -> None:
+    """Validate metadata for an activation-buffer-to-buffer NVFP4 decode."""
+    if capacity_rows <= 0 or n_cols <= 0:
+        raise ValueError("NVFP4 activation-buffer decode dimensions must be positive")
+    if n_cols % BLOCKSCALED_DISPATCH_DIM_ALIGNMENT:
+        raise ValueError(
+            "NVFP4 activation-buffer decode width must be aligned to "
+            f"{BLOCKSCALED_DISPATCH_DIM_ALIGNMENT}"
+        )
+    for offset in (qdata_offset_1, scale_offset_1, output_offset_1):
+        _validate_nvfp4_activation_buffer_metadata(
+            activation_buffer,
+            offset,
+            conditional_execution_1,
+            device=activation_buffer.device,
+            required_bytes=capacity_rows * n_cols * torch.bfloat16.itemsize,
+        )
+    if (
+        num_rows_1.dtype not in (torch.int32, torch.int64)
+        or num_rows_1.shape != (1,)
+        or not num_rows_1.is_contiguous()
+        or num_rows_1.device != activation_buffer.device
+    ):
+        raise ValueError(
+            "num_rows_1 must be a contiguous int32 or int64 tensor with shape "
+            "(1,) on the activation-buffer device"
+        )
+
+
+@torch.library.custom_op(
+    "dist_moe::dequantize_nvfp4_activation_buffer_to_buffer_",
+    mutates_args=("activation_buffer",),
+)
+def _dequantize_nvfp4_activation_buffer_to_buffer(
+    activation_buffer: torch.Tensor,
+    qdata_offset_1: torch.Tensor,
+    scale_offset_1: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    output_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool = False,
+) -> None:
+    """Conditionally decode a planner-owned NVFP4 row bundle to BF16.
+
+    Args:
+        activation_buffer: Planner-owned byte-addressed allocation.
+        qdata_offset_1: Device scalar byte offset of packed E2M1 rows.
+        scale_offset_1: Device scalar byte offset of CUBLAS-blocked E4M3 scales.
+        num_rows_1: Device scalar containing the valid padded-row count.
+        output_offset_1: Device scalar byte offset of the BF16 destination.
+        conditional_execution_1: Device predicate selecting this operation.
+        capacity_rows: Static maximum row count for graph-stable launch.
+        n_cols: Logical BF16 feature width.
+        execute_when_zero: Whether zero selects the operation.
+    """
+    _validate_nvfp4_activation_buffer_dequantization(
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        num_rows_1,
+        output_offset_1,
+        conditional_execution_1,
+        capacity_rows,
+        n_cols,
+    )
+    from .kernels.activation_buffer import ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE
+    from .kernels.triton_quantization.blockscaled_dequantize import (
+        dequantize_nvfp4_activation_buffer_to_activation_buffer,
+    )
+
+    dequantize_nvfp4_activation_buffer_to_activation_buffer(
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        num_rows_1,
+        output_offset_1,
+        conditional_execution_1,
+        capacity_rows=capacity_rows,
+        n_cols=n_cols,
+        execute_when_zero=execute_when_zero,
+        row_scale_storage_multiple=ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE,
+    )
+
+
+@_dequantize_nvfp4_activation_buffer_to_buffer.register_fake
+def _dequantize_nvfp4_activation_buffer_to_buffer_fake(
+    activation_buffer: torch.Tensor,
+    qdata_offset_1: torch.Tensor,
+    scale_offset_1: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    output_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool = False,
+) -> None:
+    """Validate fake metadata for an offset-backed NVFP4 decode."""
+    del execute_when_zero
+    _validate_nvfp4_activation_buffer_dequantization(
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        num_rows_1,
+        output_offset_1,
+        conditional_execution_1,
+        capacity_rows,
         n_cols,
     )
 
@@ -839,7 +866,7 @@ _FUSED_BLOCKSCALED_FORMAT_POLICIES: Mapping[
     {
         BlockScaledFormat.MXFP8_E4M3: _DEFAULT_FUSED_BLOCKSCALED_FORMAT_POLICY,
         BlockScaledFormat.NVFP4: _FusedBlockscaledFormatPolicy(
-            inference_only=True,
+            inference_only=False,
             requires_weight_global_scale=True,
             row_global_scale_element_size=4,
             input_dim_multiple=_NVFP4_DIM_MULTIPLE,
@@ -1187,6 +1214,160 @@ class _WeightHandle:
     blockscaled: _BlockscaledWeight
 
 
+@dataclass(frozen=True)
+class _Nvfp4Bf16BackwardAdapter:
+    """Recreate NVFP4 forward values before the shared BF16 gradient path."""
+
+    execution_context: Any
+    model_config: ModelConfig
+    blockscaled_cfg: _BlockscaledConfig
+    w13: _BlockscaledWeight
+    w2: _BlockscaledWeight
+    num_sms: int | None
+
+    def recreate_forward_activations(
+        self,
+        *,
+        forward_plan: ForwardPlan,
+        backward_plan: BackwardPlan,
+        num_recv_rows_per_local_expert_E: torch.Tensor,
+        dispatch_fwd_gather_ptrs_M: torch.Tensor,
+        combine_scatter_ptrs_M: torch.Tensor,
+        num_recv_rows_1: torch.Tensor,
+        num_local_input_tokens: int,
+    ) -> torch.Tensor:
+        """Conditionally rebuild H1/X, always rebuild Q-DQ H2, and return H3."""
+        assert backward_plan.blockscaled is not None
+        activation_buffer = self.execution_context.activation_buffer
+        assert activation_buffer is not None
+        buffers = self.execution_context.buffers
+        hidden_dim = self.model_config.hidden_dim
+        intermediate_dim = self.model_config.intermediate_dim
+        capacity_rows = dispatch_fwd_gather_ptrs_M.numel()
+        m_multiple_of = self.model_config.routing_m_multiple_of
+        assert m_multiple_of is not None
+
+        local_x_TD = torch.empty(
+            (num_local_input_tokens, hidden_dim),
+            dtype=self.model_config.dtype,
+            device=activation_buffer.buffer.device,
+        )
+        conditional_copy_activations(
+            condition=forward_plan.need_recompute,
+            lhs=local_x_TD,
+            lhs_offset=forward_plan.x_offset,
+            rhs=None,
+            rhs_offset=None,
+            activation_buffer=activation_buffer.buffer,
+            copy_to_buffer=False,
+        )
+        _stage_blockscaled_dispatch(
+            local_x_TD,
+            buffers.dispatch,
+            self.blockscaled_cfg,
+        )
+        _ep_barrier(
+            buffers.dispatch,
+            conditional_execution=forward_plan.need_recompute,
+        )
+        x_placeholder = _activation_buffer_placeholder(
+            activation_buffer.buffer,
+            (num_local_input_tokens, hidden_dim),
+            self.model_config.dtype,
+        )
+        dist_blockscaled_grouped_gemm_fprop_dispatch(
+            x=x_placeholder,
+            w=self.w13.w_q_fprop,
+            w_scale=self.w13.w_scale_fprop,
+            num_tokens_per_local_expert_E=num_recv_rows_per_local_expert_E,
+            gather_ptrs=dispatch_fwd_gather_ptrs_M,
+            num_out_tokens=capacity_rows,
+            symm_mem_buffer=buffers.dispatch,
+            topk=self.execution_context.top_k,
+            format=self.blockscaled_cfg.format,
+            layout=dist_bs_gemm.DEFAULT_LAYOUT,
+            out_dtype=self.model_config.dtype,
+            num_sms=self.num_sms,
+            sync_peers=False,
+            copy_inputs=False,
+            config=None,
+            m_multiple_of=m_multiple_of,
+            return_wgrad_quant=False,
+            blockscaled_dispatch=True,
+            activation_buffer=activation_buffer.buffer,
+            activation_offsets=backward_plan.blockscaled.recompute_dispatch_offsets,
+            conditional_execution=forward_plan.need_recompute,
+            w_global_scale_inv=self.w13.w_global_scale_inv,
+            derive_pipeline_depth=True,
+        )
+
+        # X's row bundle shares scratch with H2 in the staged recompute. Decode
+        # it before the combine producer reuses that storage.
+        dispatch_offsets = backward_plan.blockscaled.recompute_dispatch_offsets
+        _dequantize_nvfp4_activation_buffer_to_buffer(
+            activation_buffer.buffer,
+            dispatch_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+            dispatch_offsets[ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1],
+            num_recv_rows_1,
+            backward_plan.x_gathered_offset,
+            forward_plan.need_recompute,
+            capacity_rows,
+            hidden_dim,
+        )
+
+        h1_placeholder = _activation_buffer_placeholder(
+            activation_buffer.buffer,
+            (capacity_rows, 2 * intermediate_dim),
+            self.model_config.dtype,
+        )
+        h3_MD = dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(
+            h1_M2F=h1_placeholder,
+            w=self.w2.w_q_fprop,
+            w_scale=self.w2.w_scale_fprop,
+            num_tokens_per_local_expert_E=num_recv_rows_per_local_expert_E,
+            scatter_ptrs=combine_scatter_ptrs_M,
+            symm_mem_buffer=buffers.combine,
+            format=self.blockscaled_cfg.format,
+            layout=dist_bs_gemm.DEFAULT_LAYOUT,
+            out_dtype=self.model_config.dtype,
+            num_sms=self.num_sms,
+            sync_peers=False,
+            config=None,
+            m_multiple_of=m_multiple_of,
+            num_output_tokens=num_local_input_tokens,
+            return_wgrad_quant=False,
+            swiglu_fast_math=self.blockscaled_cfg.fast_math,
+            swiglu_clamped=self.execution_context.config.activation == _SWIGLU_CLAMPED,
+            swiglu_alpha=self.execution_context.config.swiglu_alpha,
+            swiglu_limit=self.execution_context.config.swiglu_limit,
+            activation_buffer=activation_buffer.buffer,
+            activation_offsets=backward_plan.blockscaled.recompute_combine_offsets,
+            num_recv_tokens=capacity_rows,
+            w_global_scale_inv=self.w2.w_global_scale_inv,
+            derive_pipeline_depth=True,
+        )
+
+        # Exactly one predicate polarity executes on each replay. Keeping both
+        # launches makes dynamic save/recompute decisions graph-stable while
+        # always materializing H2_bw = DQ(Q(SwiGLU(H1))).
+        combine_offsets = backward_plan.blockscaled.recompute_combine_offsets
+        for execute_when_zero in (False, True):
+            _dequantize_nvfp4_activation_buffer_to_buffer(
+                activation_buffer.buffer,
+                combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+                combine_offsets[
+                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1
+                ],
+                num_recv_rows_1,
+                backward_plan.h2_offset,
+                forward_plan.need_recompute,
+                capacity_rows,
+                intermediate_dim,
+                execute_when_zero,
+            )
+        return h3_MD
+
+
 def _blockscaled_storage_config(
     cfg: _BlockscaledConfig,
 ) -> BlockscaledStorageConfig:
@@ -1357,8 +1538,9 @@ def _prepare_blockscaled_weight_impl(
         w_q_fprop, w_scale_fprop, _, w_global_scale_inv = (
             _prepare_nvfp4_weight_operands(w)
         )
-        # NVFP4 remains inference-only. Populate the otherwise-unused DGRAD
-        # slots so the shared weight handle retains one fixed tensor contract.
+        # Native BF16 weights are quantized again in backward and dequantized
+        # for the shared dense gradient path. Mirror FPROP in the fixed DGRAD
+        # slots; the NVFP4 backward does not consume those packed slots.
         return _BlockscaledWeight(
             w_native=w,
             w_q_fprop=w_q_fprop,
@@ -1721,6 +1903,8 @@ def _routing_m_multiple(
     del num_sms, enable_host_tensormaps
     # Staged offset-backed scratch retains the source's 128-row routing
     # contract; its paged GEMM launch multiple is resolved separately.
+    if compute.blockscaled.save_dequantized_activations:
+        return dist_bs_gemm.DEFAULT_M_MULTIPLE_OF
     if inference_mode and compute.blockscaled.mega and compute.config is not None:
         return _inference_routing_multiple(
             compute.config, mega=compute.blockscaled.mega
@@ -1882,6 +2066,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
         comm_group: dist.ProcessGroup,
         comm_buffer: _CommunicationBuffers,
         activation_buffer: ActivationBuffer,
+        execution_context: Any | None,
         topk: int,
         num_tokens: int,
         num_experts: int,
@@ -1934,6 +2119,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
             comm_group: Expert-parallel process group.
             comm_buffer: Symmetric routing, dispatch, and combine buffers.
             activation_buffer: Activation and scratch buffer.
+            execution_context: Optional public context used by the shared
+                dense backward.
             topk: Routes per token.
             num_tokens: Local token count.
             num_experts: Global expert count.
@@ -1978,7 +2165,12 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 "dequantized activation saving requires an internal NVFP4 "
                 "training forward"
             )
-        fprop_inference_mode = inference_mode or save_dequantized_activations
+        # NVFP4 always publishes packed source rows, including a forward-only
+        # call through a training context. Saved-state allocation remains a
+        # separate per-call decision.
+        fprop_inference_mode = (
+            inference_mode or blockscaled_cfg.format is BlockScaledFormat.NVFP4
+        )
         auto_inference_tuning = fprop_inference_mode and config is None
         static_inference_storage = (
             inference_mode
@@ -2032,6 +2224,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
         ctx.wgrad_output_dtype = wgrad_output_dtype
         ctx.wgrad_destination_fn = wgrad_destination_fn
         ctx.inference_mode = inference_mode
+        ctx.execution_context = execution_context
         ctx.wgrad_postprocess_fn = wgrad_postprocess_fn
         ctx.recompute_dynamic_weight_quants = (
             save_dequantized_activations
@@ -2658,6 +2851,115 @@ class _BlockScaledAutograd(torch.autograd.Function):
             requantize_with=(compute if ctx.recompute_dynamic_weight_quants else None),
         )
 
+        if blockscaled_cfg.format is BlockScaledFormat.NVFP4:
+            if not blockscaled_cfg.save_dequantized_activations:
+                raise RuntimeError(
+                    "NVFP4 backward requires dequantized forward activations"
+                )
+            execution_context = ctx.execution_context
+            if execution_context is None:
+                raise RuntimeError("NVFP4 backward requires its execution context")
+            for name, weight in (("w13", w13_handle), ("w2", w2_handle)):
+                if weight.blockscaled.w_global_scale_inv is None:
+                    raise RuntimeError(
+                        f"NVFP4 backward requires {name} inverse global scales"
+                    )
+            w13_dq_EFD = _dequantize_nvfp4_weight(
+                w13_handle.blockscaled.w_q_fprop,
+                w13_handle.blockscaled.w_scale_fprop,
+                w13_handle.blockscaled.w_global_scale_inv,
+            )
+            w2_dq_EDF = _dequantize_nvfp4_weight(
+                w2_handle.blockscaled.w_q_fprop,
+                w2_handle.blockscaled.w_scale_fprop,
+                w2_handle.blockscaled.w_global_scale_inv,
+            )
+
+            # Adapt only the forward-value reconstruction. The planner rewind,
+            # postprocessing, native DGRAD/WGRAD kernels, gradient publication,
+            # and ownership rules remain the BF16 implementation.
+            from .api import _Bf16Autograd
+
+            dense_ctx = _KernelAutogradContext()
+            dense_ctx.w13_input_shape = w13_compute_EFD.shape
+            dense_ctx.w2_input_shape = w2_compute_EDF.shape
+            dense_ctx.set(
+                execution_context=execution_context,
+                num_local_input_tokens=num_tokens,
+                model_config=model_config,
+                options=ExecutionOptions(
+                    inplace_wgrad_accum=ctx.inplace_wgrad_accum,
+                    wgrad_destination_fn=ctx.wgrad_destination_fn,
+                    wgrad_postprocess_fn=ctx.wgrad_postprocess_fn,
+                ),
+                postprocess=postprocess,
+                postprocess_output_dtype=expert_postprocess_output_dtype,
+                blockscaled_forward_plan=BlockscaledForwardPlan(
+                    x_row_offset=x_row_offset,
+                    x_col_offset=x_col_offset,
+                    h2_row_offset=h2_row_offset,
+                    h2_col_offset=h2_col_offset,
+                    activation_offsets=forward_activation_offsets,
+                    recompute_condition=recompute_condition,
+                ),
+                bf16_backward_adapter=_Nvfp4Bf16BackwardAdapter(
+                    execution_context=execution_context,
+                    model_config=model_config,
+                    blockscaled_cfg=blockscaled_cfg,
+                    w13=w13_handle.blockscaled,
+                    w2=w2_handle.blockscaled,
+                    num_sms=num_sms,
+                ),
+            )
+            dense_ctx.saved_tensors = (
+                w13_dq_EFD,
+                w2_dq_EDF,
+                topk_expert_ids_TK,
+                topk_scores_TK,
+                num_tokens_per_local_expert_E,
+                dispatch_bwd_gather_ptrs,
+                dispatch_fwd_gather_ptrs,
+                combine_scatter_ptrs,
+                num_recv_tokens_per_rank,
+                num_recv_tokens,
+                need_recompute,
+                x_offset,
+                x_gathered_offset,
+                h1_offset,
+                h2_offset,
+                h3_offset,
+                activation_slot_id_1,
+                postprocess_context,
+            )
+            dense_gradients = _Bf16Autograd._backward_impl(
+                dense_ctx,
+                grad_output_TD,
+                wgrad_destinations=wgrad_destinations,
+                wgrad_output_dtype=ctx.wgrad_output_dtype,
+            )
+            grad_x_TD = dense_gradients[0]
+            grad_topk_scores_TK = dense_gradients[2]
+            grad_w13_EFD = dense_gradients[3]
+            grad_w2_EDF = dense_gradients[4]
+            if clear_parameter_grads_before_return and wgrad_destinations is not None:
+                for destination in wgrad_destinations:
+                    if destination.parameter is not None:
+                        destination.parameter.grad = None
+            if ctx.w13_orig_shape is not None:
+                if grad_w13_EFD is not None:
+                    grad_w13_EFD = grad_w13_EFD.view(ctx.w13_orig_shape)
+                if grad_w2_EDF is not None:
+                    grad_w2_EDF = grad_w2_EDF.view(ctx.w2_orig_shape)
+            external_wgrad_destination = ctx.wgrad_destination_fn is not None
+            return (
+                grad_x_TD,
+                None,
+                grad_topk_scores_TK,
+                None if external_wgrad_destination else grad_w13_EFD,
+                None if external_wgrad_destination else grad_w2_EDF,
+                *((None,) * 38),
+            )
+
         # 3. Reconstruct typed plan views from the saved scalar offsets. The
         # shared planner is mutated in place when backward releases its slot.
         forward_plan = ForwardPlan(
@@ -3118,7 +3420,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
             grad_topk_scores_TK,
             None if external_wgrad_destination else grad_w13_EFD,
             None if external_wgrad_destination else grad_w2_EDF,
-            *((None,) * 37),
+            *((None,) * 38),
         )
 
 
@@ -3185,6 +3487,7 @@ def _run_blockscaled_eager(
     activation_buffer: ActivationBuffer,
     max_imbalance_factor: float,
     *,
+    execution_context: Any | None = None,
     save_for_backward: bool,
     weights_preprocess_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     experts_postprocess_fn: _ExpertsOutputPostprocess = None,
@@ -3228,6 +3531,7 @@ def _run_blockscaled_eager(
         activation_buffer: Shared buffer for activation saving.
         max_imbalance_factor: Maximum token imbalance factor for recompute decision.
             If the ratio of max tokens per rank to average exceeds this, recompute is used.
+        execution_context: Optional public context used by NVFP4's BF16 backward.
         save_for_backward: Whether this invocation has a backward consumer.
         weights_preprocess_fn: Optional function to dequantize compact weights (e.g. FP8)
             to compute dtype (e.g. BF16) before GEMM operations. If provided, the original
@@ -3403,6 +3707,7 @@ def _run_blockscaled_eager(
         comm_group,
         comm_buffer,
         activation_buffer,
+        execution_context,
         topk,
         num_tokens,
         num_experts,
@@ -3962,7 +4267,7 @@ def _run_async_forward(
     assert activation_buffer is not None
     blockscaled_cfg, config = _blockscaled_compute_config(context)
     save_dequantized_activations = (
-        save_for_backward and blockscaled_cfg.format is BlockScaledFormat.NVFP4
+        save_for_backward and blockscaled_cfg.format == BlockScaledFormat.NVFP4
     )
     if interleaved_fc13 and (
         not context.config.inference or not blockscaled_cfg.mega or save_for_backward
@@ -3982,6 +4287,9 @@ def _run_async_forward(
             else None
         ),
     )
+    # The NVFP4 backward delegates its dense gradient sequence to the BF16
+    # implementation, which consumes this same context-owned storage.
+    kernel_ctx.execution_context = context
     (
         w13_q_fprop,
         w13_scale_fprop,
@@ -4018,6 +4326,7 @@ def _run_async_forward(
         comm_group=context.group,
         comm_buffer=context.buffers,
         activation_buffer=activation_buffer,
+        execution_context=context,
         topk=context.top_k,
         num_tokens=x_TD.shape[0],
         num_experts=context.config.num_experts,
@@ -4318,6 +4627,11 @@ def _run_block_scaled_registered_backward(
     assert policy is not None and activation_buffer is not None
     kernel_format = _kernel_block_scaled_format(policy.format)
     blockscaled_cfg, config = _blockscaled_compute_config(context)
+    if kernel_format in FP4_FORMATS:
+        blockscaled_cfg = replace(
+            blockscaled_cfg,
+            save_dequantized_activations=True,
+        )
     postprocess_config = _rmsnorm_from_registered_args(
         None,
         rmsnorm_enabled,
@@ -4354,7 +4668,7 @@ def _run_block_scaled_registered_backward(
         w13_orig_shape=None,
         w2_orig_shape=None,
         weights_preprocess_fn=None,
-        recompute_dynamic_weight_quants=False,
+        recompute_dynamic_weight_quants=kernel_format in FP4_FORMATS,
         inplace_wgrad_accum=False,
         w13_param_ref=None,
         w2_param_ref=None,
@@ -4390,6 +4704,7 @@ def _run_block_scaled_registered_backward(
         ),
         comm_group=context.group,
         activation_buffer=activation_buffer,
+        execution_context=context,
         activation=context.config.activation,
         swiglu_alpha=context.config.swiglu_alpha,
         swiglu_limit=context.config.swiglu_limit,
@@ -5015,6 +5330,12 @@ def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public executio
 
     prepared_w13 = w13_weight if isinstance(w13_weight, PreparedWeight) else None
     prepared_w2 = w2_weight if isinstance(w2_weight, PreparedWeight) else None
+    if (
+        policy.format == BlockScaledFormat.NVFP4
+        and not context.config.inference
+        and (prepared_w13 is not None or prepared_w2 is not None)
+    ):
+        raise ValueError("NVFP4 training contexts require native BF16 weights")
     interleaved_fc13 = prepared_w13 is not None and prepared_w13._interleaved_fc13
     if prepared_w2 is not None and prepared_w2._interleaved_fc13:
         raise ValueError("interleaved prepared W13 cannot be used as W2")
@@ -5124,9 +5445,17 @@ def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public executio
         )
 
     blockscaled_cfg, kernel_config = _blockscaled_compute_config(context)
+    save_dequantized_activations = (
+        save_for_backward and blockscaled_cfg.format == BlockScaledFormat.NVFP4
+    )
     blockscaled_cfg = replace(
         blockscaled_cfg,
         interleaved_fc13=interleaved_fc13,
+        save_dequantized_activations=save_dequantized_activations,
+        static_inference_storage=(
+            blockscaled_cfg.static_inference_storage
+            and not save_dequantized_activations
+        ),
         routing_capacity=(
             context.memory_plan.total_scratch_capacity_rows
             if context.config.inference and context.memory_plan is not None
@@ -5143,6 +5472,7 @@ def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public executio
         comm_buffer=context.buffers,
         activation_buffer=activation_buffer,
         max_imbalance_factor=context.config.device_scratch_capacity_factor,
+        execution_context=context,
         save_for_backward=save_for_backward,
         weights_preprocess_fn=options.weights_preprocess_fn,
         experts_postprocess_fn=options.experts_output_postprocess,

@@ -1,11 +1,10 @@
-# NVFP4 Inference Execution
+# NVFP4 Execution
 
-This guide follows one NVFP4 Dist-MoE invocation from weight preparation to
-the returned BF16 output. For the numeric format, scale swizzle, and warp-level
+This guide follows NVFP4 Dist-MoE inference and training. Forward uses real
+NVFP4 tensor-core GEMMs. Training recreates quantized forward operands and
+then reuses the BF16 input-gradient (**DGRAD**) and weight-gradient
+(**WGRAD**) sequence. For the numeric format, scale swizzle, and warp-level
 MMA design, see [`nvfp4_kernel_design.md`](nvfp4_kernel_design.md).
-
-NVFP4 uses only forward propagation (**FPROP**). It has no input-gradient
-(**DGRAD**) or weight-gradient (**WGRAD**) path in this release.
 
 ## Outline
 
@@ -14,6 +13,7 @@ NVFP4 uses only forward propagation (**FPROP**). It has no input-gradient
 - [Prepare weights](#prepare-weights)
 - [Plan context memory](#plan-context-memory)
 - [Follow the forward pass](#follow-the-forward-pass)
+- [Follow the backward pass](#follow-the-backward-pass)
 - [Understand the packed dispatch row](#understand-the-packed-dispatch-row)
 - [Choose staged or Mega](#choose-staged-or-mega)
 - [Capture and replay CUDA graphs](#capture-and-replay-cuda-graphs)
@@ -22,10 +22,11 @@ NVFP4 uses only forward propagation (**FPROP**). It has no input-gradient
 <a id="public-contract"></a>
 ## Public contract
 
-NVFP4 is an inference-only mode. Expert ID `-1` marks an inactive route: it is
-absent from communication and expert kernels, and final reduction masks the
-unwritten combine slot so an all-padding token produces an exact zero output
-row. The following fragment assumes the imports,
+NVFP4 supports training with native BF16 weights and inference with native
+BF16 or explicitly prepared NVFP4 weights. Expert ID `-1` marks an inactive
+route: it is absent from communication and expert kernels, and final reduction
+masks the unwritten combine slot so an all-padding token produces an exact
+zero output row. The following fragment assumes the imports,
 tensor names, dimensions, device, and expert-parallel group from the README
 quickstart:
 
@@ -41,9 +42,9 @@ config = dist_moe.Config(
     top_k=K,
     num_experts=E,
     max_moe_layers_per_activation_slot=1,
-    num_activation_slots=0,
+    num_activation_slots=1,
     block_scaled=policy,
-    inference=True,
+    inference=False,
 )
 context = dist_moe.create_context(group=ep_group, config=config)
 y_TD = dist_moe.routed_experts(
@@ -54,17 +55,19 @@ y_TD = dist_moe.routed_experts(
     w2_EDF,
     context,
 )
+y_TD.float().sum().backward()
 ```
 
 `D` and `F` must satisfy the NVFP4 alignment and maximum-dimension checks.
-Autograd is rejected. Native BF16 weights are quantized inside every
-invocation, including every CUDA-graph replay. Callers can instead prepare
-weights explicitly; prepared weights remain caller-owned for repeated eager
+Training applies straight-through-estimator semantics to quantization:
+forward quantizes native BF16 weights, backward quantizes them again and
+dequantizes the result for BF16 DGRAD. Prepared NVFP4 weights are rejected in
+training.
+
+For inference, use `inference=True` and `num_activation_slots=0`. Native BF16
+weights are quantized inside every invocation, including every CUDA-graph
+replay. Explicitly prepared weights remain caller-owned for repeated eager
 calls or replay and avoid that repeated quantization.
-Unlike MXFP8 evaluation, wrapping a training context in `torch.no_grad()` does
-not enable NVFP4: the format requires the static inference context because its
-routing, packed dispatch, weight contract, and memory layout are
-inference-specialized.
 
 Staged inference retains the asynchronous source's 128-row routing and launch
 selection. Compact automatic decode tuning applies to the matched Mega
@@ -75,7 +78,7 @@ operand layout, not to staged offset-backed scratch.
 
 Use the same routing assignment as the
 [BF16 running example](bf16_execution.md#running-example): rank 0 owns `E0`
-and `E1` and computes `E0[A,C], E1[B,D]`. Unlike training, each source rank
+and `E1` and computes `E0[A,C], E1[B,D]`. In both modes, each source rank
 quantizes its tokens before publishing them:
 
 ```text
@@ -88,9 +91,9 @@ rank 0 gathers packed A, C for E0 and packed B, D for E1
   -> rank 0 reduces the two route outputs for A and B
 ```
 
-There is no saved-state or reverse flow. The packed dispatch rows and local
-scratch may be overwritten after the invocation; only the returned BF16 token
-outputs, native source weights, and any caller-owned prepared weights survive.
+Inference has no saved-state or reverse flow. Training saves either dense
+backward operands or the original local BF16 input plus routing/planner state;
+backward uses the same peer paths in reverse for DGRAD.
 
 <a id="prepare-weights"></a>
 ## Prepare weights
@@ -115,12 +118,14 @@ The resulting `dist_moe.PreparedWeight` owns:
 | `fprop_scale` | CUBLAS-blocked E4M3 | Per-16-value FPROP scales in the kernel-native swizzle. |
 | `global_scale` | FP32 `[E_local]` | Per-expert quantization scale retained for inspection and ownership. |
 | `global_scale_inv` | FP32 `[E_local]` | Reciprocal consumed directly by FPROP kernels. |
-| `dgrad_data`, `dgrad_scale` | `None` | NVFP4 has no backward path. |
+| `dgrad_data`, `dgrad_scale` | `None` | Prepared NVFP4 is inference-only. |
 
 Explicit preparation is outside `dist_moe.routed_experts()`. Reusing the
 prepared object therefore does not requantize weights during each invocation
 or CUDA-graph replay. Passing BF16 weights performs the identical preparation
-inside the registered forward operation instead.
+inside the registered forward operation instead. Training repeats that
+preparation in backward and exactly dequantizes the regenerated operands to
+BF16; it never saves packed weights across the autograd boundary.
 Non-strict `make_fx` captures the same registered block-scaled forward without
 introducing autograd state.
 
@@ -169,6 +174,12 @@ configuration selects this planner-backed execution; operands are not
 individually reclassified or separately mapped. The packed row format and
 arithmetic are unchanged by that choice.
 
+Training uses the hybrid activation plan. A full-save decision retains
+`X_bw = DQ(Q(X_gathered))`, the BF16 H1 emitted by the real NVFP4 W13 GEMM,
+and BF16 H3. A recompute decision retains only the original local BF16 X.
+Both decisions keep fixed routing, planner, and postprocessing state. H2 and
+all packed activation/weight tensors are transient scratch.
+
 <a id="follow-the-forward-pass"></a>
 ## Follow the forward pass
 
@@ -190,19 +201,51 @@ local token results `A/B`; rank 1 performs the symmetric work for `C/D`.
 
 | Phase | Callable | Reads | Writes | Residency | Saved or recomputed | Synchronization |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `_stage_blockscaled_dispatch` | local BF16 `x_TD` | packed qdata, E4M3 scales, and FP32 inverse row scale | local rank's symmetric dispatch HBM | not saved; inference scratch is reusable after the call | none inside quantization |
-| 2 | `_ep_barrier` | dispatch and routing publication state | symmetric-memory signal state | device | no backward state | EP device barrier before peer reads |
-| 3 | `dist_dispatch_routing` | global top-k IDs and published row addresses | per-expert counts, gather pointers, scatter pointers | local HBM metadata referring to local or peer HBM | invocation-local only | no CPU synchronization |
-| 4 | scratch binding | received-row counts and static model geometry | static views for device-only Mega; GPU offsets for staged or VMM-configured inference | context-owned scratch | no backward state | planner-backed paths run `get_forward_plan`; device-only Mega skips that launch and the unused count clone |
-| 5a | staged distributed W13 GEMM | peer packed rows, dynamically or explicitly prepared W13 qdata/scales/global inverse | W13 result and fused activation state at planner offsets | scratch; peer input remains in symmetric HBM | overwritten by the next invocation | kernel-internal producer/consumer ordering |
-| 5b | staged fused SwiGLU/W2/combine | staged activation, dynamically or explicitly prepared W2 qdata/scales/global inverse, scatter pointers | combined expert output | local output plus peer symmetric combine stores | no recompute path exists | device barrier before peer combine consumption |
-| 5c | Mega fused forward | packed rows, both dynamically or explicitly prepared weights, routing metadata, and static views or VMM scratch offsets | combined expert output | scratch and peer symmetric combine HBM | no backward state or recompute | fixed chunk-pipeline ordering and peer barrier |
+| 1 | `_stage_blockscaled_dispatch` | local BF16 `x_TD` | packed qdata, E4M3 scales, and FP32 inverse row scale | local rank's symmetric dispatch HBM | packed rows are transient | none inside quantization |
+| 2 | `_ep_barrier` | dispatch and routing publication state | symmetric-memory signal state | device | routing state is retained for training | EP device barrier before peer reads |
+| 3 | `dist_dispatch_routing` | global top-k IDs and published row addresses | per-expert counts, gather pointers, scatter pointers | local HBM metadata referring to local or peer HBM | retained for training | no CPU synchronization |
+| 4 | planner binding | received-row counts and static model geometry | activation-slot and scratch offsets; static views only for device-only inference Mega | context-owned memory | training dynamically selects full-save or recompute | planner-backed paths run `get_forward_plan`; device-only inference Mega skips that launch and the unused count clone |
+| 5a | staged distributed W13 GEMM | peer packed rows and dynamic/prepared W13 operands | BF16 H1 and optional dense X_bw | activation slot or scratch | full-save retains H1 and X_bw | kernel-internal producer/consumer ordering |
+| 5b | staged fused SwiGLU/W2/combine | H1, dynamic/prepared W2 operands, scatter pointers | packed H2 scratch and BF16 H3 | activation slot, scratch, and peer combine HBM | full-save retains H3; H2 is never retained | device barrier before peer combine consumption |
+| 5c | Mega fused forward | packed rows, both dynamic/prepared weights, routing metadata, and planner/static views | BF16 H1/H3 and optional dense X_bw | activation slot, scratch, and peer combine HBM | training retains the same logical full-save state as staged | fixed chunk-pipeline ordering and peer barrier |
 | 6 | `_async_forward_postprocess` | combined rows and top-k scores | BF16 `y_TD` | local HBM | returned output only | no host synchronization |
 
 Only one of the staged pair or the Mega launch executes. Both consume the same
 prepared row format, routing metadata, and packed symmetric dispatch rows.
 Scratch binding follows the context/pipeline contract above; G8 is Mega-only
 and remains subject to its source topology and offset restrictions.
+
+<a id="follow-the-backward-pass"></a>
+## Follow the backward pass
+
+The registered backward regenerates both NVFP4 weight operands from the native
+BF16 weights, exactly dequantizes them, and delegates the dense gradient
+sequence to the BF16 implementation.
+
+If the device planner selected recompute, backward republishes the saved local
+X as packed NVFP4, repeats staged W13 and W2 forward compute, and materializes
+`X_bw`, H1, and H3. This staged reconstruction is used for both original
+forward pipelines. If it selected full-save, those values already occupy the
+activation slot.
+
+For both decisions, backward reruns SwiGLU and the NVFP4 H2 quantizer, then
+dequantizes the result as
+`H2_bw = DQ(Q(SwiGLU(H1)))`. The existing BF16 sequence then performs:
+
+```text
+grad_Y, scores, H3
+  -> score/reduction backward -> grad_scores, grad_H3
+  -> BF16 W2 DGRAD with DQ(Q(W2)) -> grad_H2
+  -> BF16 W2 WGRAD with H2_bw -> grad_W2
+  -> SwiGLU backward with H1 -> grad_H1
+  -> BF16 W13 DGRAD with DQ(Q(W13)) -> route grad_X
+  -> BF16 W13 WGRAD with X_bw -> grad_W13
+  -> peer scatter and top-k reduction -> grad_X
+```
+
+The planner rewind, WGRAD ownership/callback policy, postprocessing backward,
+and output-gradient ownership are the BF16 contracts. Packed Q(X), Q(H2), and
+Q(W) never cross the autograd boundary.
 
 <a id="understand-the-packed-dispatch-row"></a>
 ## Understand the packed dispatch row
@@ -240,9 +283,9 @@ the device-offset plan and device tensor maps. The G8 offset-backed source path
 requires its admitted producer topology rather than remapping selected operands
 to make an unsupported shape run.
 
-Neither path saves activations, routing snapshots, DGRAD operands, or WGRAD
-operands for backward. The returned BF16 output is the only user-visible
-result.
+Inference saves no activations or routing snapshots. Training exposes the same
+fixed private state schema for either pipeline and retains only the dense
+operands selected by the device planner.
 
 <a id="capture-and-replay-cuda-graphs"></a>
 ## Capture and replay CUDA graphs
@@ -263,13 +306,13 @@ row buffer or changing the captured kernel sequence.
 
 Construction or invocation fails before kernel execution when:
 
-- `inference=False` is paired with NVFP4;
 - a dimension violates NVFP4 alignment or supported maxima;
-- a weight is neither native BF16 nor a prepared NVFP4 operand;
+- a training weight is not native BF16;
+- an inference weight is neither native BF16 nor a prepared NVFP4 operand;
 - a prepared weight's required global scales or reciprocal scales are absent
   or malformed;
 - input tokens exceed `max_num_local_input_tokens`; or
 - the selected scratch capacity cannot represent the configured receive bound.
 
-These checks prevent an unsupported training path, an incorrectly packed row,
-or an undersized scratch plan from reaching the kernels.
+These checks prevent an invalid weight contract, incorrectly packed row, or
+undersized activation/scratch plan from reaching the kernels.

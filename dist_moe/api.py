@@ -254,12 +254,13 @@ class BlockScaledConfig:
     """CuTe block-scaled compute policy for a distributed MoE context.
 
     Args:
-        format: MXFP8 E4M3 training/inference or NVIDIA FP4 inference operands.
+        format: MXFP8 E4M3 or NVIDIA FP4 training/inference operands.
         fast_math: Whether MXFP8 fused SwiGLU uses approximate sigmoid math.
-            NVFP4 inference does not support this option.
+            NVFP4 does not support this option.
         pipeline: ``"staged"`` for separate expert GEMMs or ``"mega"`` for
             the fused chunk-pipelined forward. MXFP8 Mega also fuses each
-            DGRAD/WGRAD pair; NVFP4 remains forward-only.
+            DGRAD/WGRAD pair. NVFP4 reuses the BF16 backward for either
+            forward pipeline.
         kernel_config: Optional expert pipeline override; ``None`` selects the
             shape-aware defaults.
     """
@@ -314,8 +315,6 @@ def _validate_block_scaled_config(config: Config) -> None:
             f"by the format vector size {vector_size}"
         )
     if policy.format is BlockScaledFormat.NVFP4:
-        if not config.inference:
-            raise ValueError("NVFP4 DistMoE is inference-only")
         if (
             config.hidden_dim % _NVFP4_DIM_MULTIPLE
             or config.intermediate_dim % _NVFP4_DIM_MULTIPLE
@@ -858,6 +857,11 @@ def _model_config(
         routing_world_size=ep_size,
         routing_m_multiple_of=routing_m_multiple,
         mega=config.block_scaled is not None and config.block_scaled.pipeline == "mega",
+        save_dequantized_activations=(
+            config.block_scaled is not None
+            and config.block_scaled.format is BlockScaledFormat.NVFP4
+            and not config.inference
+        ),
     )
 
 
@@ -2251,7 +2255,9 @@ class _Bf16Autograd(torch.autograd.Function):
         """
         # 1. Recover immutable call policy plus the device-resident planner and
         # routing state saved by the matching forward invocation.
-        context = _get_context(ctx.context_id)
+        context = getattr(ctx, "execution_context", None)
+        if context is None:
+            context = _get_context(ctx.context_id)
         config = context.config
         options: ExecutionOptions = ctx.options
         buffers = context.buffers
@@ -2342,6 +2348,7 @@ class _Bf16Autograd(torch.autograd.Function):
             h2_offset=h2_offset,
             h3_offset=h3_offset,
             activation_slot_id_1=activation_slot_id_1,
+            blockscaled=getattr(ctx, "blockscaled_forward_plan", None),
         )
         backward_plan = get_backward_plan(
             num_recv_tokens=num_recv_rows_1,
@@ -2367,9 +2374,12 @@ class _Bf16Autograd(torch.autograd.Function):
             num_groups=w13_EFD.shape[0],
         )
         assert fprop_config is not None and wgrad_config is not None
+        backward_adapter = getattr(ctx, "bf16_backward_adapter", None)
 
         # 3. Recompute H1/H3 only when needed. H2 is always transient scratch,
-        # so its activation kernel runs even when H1 was saved.
+        # so its activation kernel runs even when H1 was saved. Block-scaled
+        # forward formats may provide a narrow adapter that recreates these
+        # three forward values before this shared dense gradient sequence.
         _initialize_fake_peer_scatter_output(buffers.combine)
         with record_function("dist_moe_recompute"):
             dispatch_local_TD = buffers.dispatch.hdl.get_buffer(
@@ -2377,57 +2387,71 @@ class _Bf16Autograd(torch.autograd.Function):
                 (num_local_input_tokens, context.hidden_dim),
                 torch.bfloat16,
             )
-            copy_activation_to_dispatch(
-                dispatch=dispatch_local_TD,
-                activation_buffer=activation_buffer.buffer,
-                activation_offset=x_offset,
-                condition=need_recompute,
-            )
-            _ep_barrier(buffers.dispatch, conditional_execution=need_recompute)
-            dist_grouped_gemm_fprop_dispatch(
-                x=x_offset,
-                w=w13_EFD,
-                num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
-                gather_ptrs=dispatch_fwd_gather_ptrs_M,
-                num_out_tokens=None,
-                symm_mem_buffer=buffers.dispatch,
-                topk=context.top_k,
-                num_sms=config.num_sms,
-                activation_buffer=activation_buffer.buffer,
-                y=backward_plan.h1_offset,
-                x_gathered=backward_plan.x_gathered_offset,
-                conditional_execution=need_recompute,
-                config=fprop_config,
-                estimate_recv_num_tokens=estimated_num_recv_rows,
-            )
-            # H2 is always transient scratch, even when H1 was saved. Rebuild
-            # it unconditionally before W2 WGRAD, matching the internal order.
-            swiglu_fwd(
-                x=backward_plan.h1_offset,
-                z=backward_plan.h2_offset,
-                clamped=config.activation == "swiglu_clamped",
-                alpha=config.swiglu_alpha,
-                limit=config.swiglu_limit,
-                situ_glu=config.activation == "situ_glu",
-                situ_glu_gate_beta=config.situ_glu_beta,
-                situ_glu_up_beta=config.situ_glu_linear_beta,
-                activation_buffer=activation_buffer.buffer,
-                num_recv_tokens=num_recv_rows_1,
-                feature_dim=w2_EDF.shape[2],
-                dtype=w2_EDF.dtype,
-            )
-            h3_saved_MD = dist_grouped_gemm_fprop_combine(
-                x=backward_plan.h2_offset,
-                w=w2_EDF,
-                num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
-                scatter_ptrs=combine_scatter_ptrs_M,
-                symm_mem_buffer=buffers.combine,
-                num_sms=config.num_sms,
-                activation_buffer=activation_buffer.buffer,
-                conditional_execution=need_recompute,
-                config=combine_config,
-                estimate_recv_num_tokens=estimated_num_recv_rows,
-            )
+            if backward_adapter is None:
+                copy_activation_to_dispatch(
+                    dispatch=dispatch_local_TD,
+                    activation_buffer=activation_buffer.buffer,
+                    activation_offset=x_offset,
+                    condition=need_recompute,
+                )
+                _ep_barrier(
+                    buffers.dispatch,
+                    conditional_execution=need_recompute,
+                )
+            if backward_adapter is None:
+                dist_grouped_gemm_fprop_dispatch(
+                    x=x_offset,
+                    w=w13_EFD,
+                    num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
+                    gather_ptrs=dispatch_fwd_gather_ptrs_M,
+                    num_out_tokens=None,
+                    symm_mem_buffer=buffers.dispatch,
+                    topk=context.top_k,
+                    num_sms=config.num_sms,
+                    activation_buffer=activation_buffer.buffer,
+                    y=backward_plan.h1_offset,
+                    x_gathered=backward_plan.x_gathered_offset,
+                    conditional_execution=need_recompute,
+                    config=fprop_config,
+                    estimate_recv_num_tokens=estimated_num_recv_rows,
+                )
+                # H2 is always transient scratch, even when H1 was saved.
+                swiglu_fwd(
+                    x=backward_plan.h1_offset,
+                    z=backward_plan.h2_offset,
+                    clamped=config.activation == "swiglu_clamped",
+                    alpha=config.swiglu_alpha,
+                    limit=config.swiglu_limit,
+                    situ_glu=config.activation == "situ_glu",
+                    situ_glu_gate_beta=config.situ_glu_beta,
+                    situ_glu_up_beta=config.situ_glu_linear_beta,
+                    activation_buffer=activation_buffer.buffer,
+                    num_recv_tokens=num_recv_rows_1,
+                    feature_dim=w2_EDF.shape[2],
+                    dtype=w2_EDF.dtype,
+                )
+                h3_saved_MD = dist_grouped_gemm_fprop_combine(
+                    x=backward_plan.h2_offset,
+                    w=w2_EDF,
+                    num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
+                    scatter_ptrs=combine_scatter_ptrs_M,
+                    symm_mem_buffer=buffers.combine,
+                    num_sms=config.num_sms,
+                    activation_buffer=activation_buffer.buffer,
+                    conditional_execution=need_recompute,
+                    config=combine_config,
+                    estimate_recv_num_tokens=estimated_num_recv_rows,
+                )
+            else:
+                h3_saved_MD = backward_adapter.recreate_forward_activations(
+                    forward_plan=forward_plan,
+                    backward_plan=backward_plan,
+                    num_recv_rows_per_local_expert_E=(num_recv_rows_per_local_expert_E),
+                    dispatch_fwd_gather_ptrs_M=dispatch_fwd_gather_ptrs_M,
+                    combine_scatter_ptrs_M=combine_scatter_ptrs_M,
+                    num_recv_rows_1=num_recv_rows_1,
+                    num_local_input_tokens=num_local_input_tokens,
+                )
             h3_saved_MD = h3_saved_MD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
             ]
@@ -2441,7 +2465,12 @@ class _Bf16Autograd(torch.autograd.Function):
                     activation_buffer=activation_buffer.buffer,
                     copy_to_buffer=False,
                 )
-            _ep_barrier(buffers.combine, conditional_execution=need_recompute)
+            _ep_barrier(
+                buffers.combine,
+                conditional_execution=(
+                    need_recompute if backward_adapter is None else None
+                ),
+            )
 
         # 4. Reverse postprocessing before expert DGRAD/WGRAD so both paths
         # consume the same route-wise gradient representation.
@@ -2485,6 +2514,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 dx=backward_plan.grad_h2_offset,
                 dy_gathered=backward_plan.grad_h3_gathered_offset,
                 config=fprop_config,
+                has_padding_sentinels=backward_adapter is not None,
             )
 
             if wgrad_destinations is None:
@@ -2543,6 +2573,7 @@ class _Bf16Autograd(torch.autograd.Function):
                     swiglu_clamped=config.activation == "swiglu_clamped",
                     swiglu_alpha=config.swiglu_alpha,
                     swiglu_limit=config.swiglu_limit,
+                    has_padding_sentinels=backward_adapter is not None,
                 )
             else:
                 swiglu_bwd(
@@ -2569,6 +2600,7 @@ class _Bf16Autograd(torch.autograd.Function):
                     num_sms=config.num_sms,
                     activation_buffer=activation_buffer.buffer,
                     config=fprop_config,
+                    has_padding_sentinels=backward_adapter is not None,
                 )
             grad_x_TKD = grad_x_TKD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
@@ -3917,9 +3949,9 @@ def routed_experts(  # noqa: C901
             ``[E_local, 2, F, D]``, ``[E_local, 2F, D]``, or
             ``[E_local * 2F, D]``, or a prepared MXFP8/NVFP4 operand whose
             source has one of those shapes. Native NVFP4 weights are
-            quantized during each inference invocation; prepared NVFP4
-            operands avoid that repeated work. NVFP4 requires an inference
-            context.
+            quantized during each invocation. Prepared NVFP4 operands avoid
+            that repeated work for inference; training requires native BF16
+            weights.
         w2_weight: Local BF16 down weight with shape ``[E_local, D, F]`` or
             ``[E_local * D, F]``, or a matching prepared MXFP8/NVFP4 operand.
         context: Factory-created execution context for these static shapes.

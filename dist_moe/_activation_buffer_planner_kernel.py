@@ -689,6 +689,7 @@ def _triton_get_blockscaled_backward_plan(
     peak_min_free_space_ptr,
     need_recompute_ptr,
     fwd_x_offset_ptr,
+    fwd_x_gathered_offset_ptr,
     fwd_h1_offset_ptr,
     fwd_x_col_offset_ptr,
     fwd_h2_col_offset_ptr,
@@ -716,6 +717,7 @@ def _triton_get_blockscaled_backward_plan(
     moe_layer_id_ptr,
     mega: tl.constexpr,
     native_backward: tl.constexpr,
+    save_dequantized_activations: tl.constexpr,
 ):
     """Compute the block-scaled backward plan (offsets only).
 
@@ -741,6 +743,14 @@ def _triton_get_blockscaled_backward_plan(
 
       no-recompute  scratch [x_gathered | h2 | grad_h3_gathered | grad_h2 | grad_h1]
       recompute     scratch [row slot | h1 | x_gathered | h2 | grad_h3_gathered | grad_h2 | grad_h1]
+
+    With save_dequantized_activations, X and H1 already use the BF16 backward
+    representation. Recompute temporarily needs the NVFP4 row slot before the
+    same liveness-aware dense gradient workspace used by the BF16 planner:
+
+      no-recompute  scratch [h2/grad_h1 | grad_h2 | grad_h3_gathered]
+      recompute     scratch [row slot | h2/grad_h1 | grad_h2 |
+                             grad_h3_gathered | h1 | x_gathered]
 
     Finally buffer_offsets, saved bytes, and moe_layer_id are rewound to undo the
     matching forward layer's allocation. num_recv_tokens_ptr carries routing's
@@ -789,7 +799,12 @@ def _triton_get_blockscaled_backward_plan(
     h2_row_size = h2_row_q_size + h2_row_scale_size
     dxy_row_size = dxy_row_q_size + dxy_row_scale_size
     x_row_offset = scratch_end - x_row_size  # x_gathered row (FC13 DGRAD, recompute)
-    if mega or native_backward:
+    if save_dequantized_activations:
+        # The dense backward dequantizes X before the serialized H2 producer
+        # reuses this row slot, including when the forward used Mega.
+        recompute_h2_row_offset = scratch_end - h2_row_size
+        recompute_row_slot_size = tl.maximum(x_row_size, h2_row_size)
+    elif mega or native_backward:
         # Mega co-feeds the row bundles; native backward dequantizes both first.
         recompute_h2_row_offset = x_row_offset - h2_row_size
         recompute_row_slot_size = tl.maximum(x_row_size + h2_row_size, dxy_row_size)
@@ -800,11 +815,21 @@ def _triton_get_blockscaled_backward_plan(
         )
     dxy_row_offset = scratch_end - dxy_row_size
     # Tensormap preparation still materializes h2 pointers for a skipped recompute.
-    h2_row_offset = tl.where(need_recompute, recompute_h2_row_offset, dxy_row_offset)
+    if save_dequantized_activations:
+        h2_row_offset = scratch_end - h2_row_size
+    else:
+        h2_row_offset = tl.where(
+            need_recompute, recompute_h2_row_offset, dxy_row_offset
+        )
     no_recompute_row_slot_size = tl.maximum(x_row_size, dxy_row_size)
-    row_slot_size = tl.where(
-        need_recompute, recompute_row_slot_size, no_recompute_row_slot_size
-    )
+    if save_dequantized_activations:
+        # A saved layer regenerates only H2's row quant. It can overlap H2's
+        # future dense destination because dequantization ends that lifetime.
+        row_slot_size = tl.where(need_recompute, recompute_row_slot_size, h2_row_size)
+    else:
+        row_slot_size = tl.where(
+            need_recompute, recompute_row_slot_size, no_recompute_row_slot_size
+        )
     row_slot_offset = scratch_end - row_slot_size
     # Later DGRAD launches are serialized and reuse the row scratch.
     grad_h3_row_offset = x_row_offset  # grad_h3 row (FC2 DGRAD); reuses dead x_row slot
@@ -854,7 +879,36 @@ def _triton_get_blockscaled_backward_plan(
     grad_h1_offset = zero
 
     cursor = row_slot_offset
-    if native_backward:
+    if save_dequantized_activations:
+        # Match the BF16 backward's liveness reuse. Recompute keeps the NVFP4
+        # row slot disjoint until X has been dequantized and H2 has been
+        # produced; a saved layer may reuse the future dense H2 destination.
+        dense_scratch_end = tl.where(need_recompute, row_slot_offset, scratch_end)
+        grad_h1_offset = dense_scratch_end - h1_size
+        grad_h2_offset = grad_h1_offset - grad_h2_size
+        h2_offset = dense_scratch_end - grad_h2_size
+        if hidden_dim <= intermediate_dim:
+            grad_h3_gathered_offset = h2_offset - x_gathered_size
+        else:
+            grad_h3_gathered_offset = grad_h2_offset - x_gathered_size
+        scratch_grad_bottom = tl.minimum(grad_h2_offset, grad_h3_gathered_offset)
+        if need_recompute:
+            h1_offset = scratch_grad_bottom - h1_size
+            x_gathered_offset = h1_offset - x_gathered_size
+            scratch_bottom = x_gathered_offset
+        else:
+            h1_offset = tl.load(fwd_h1_offset_ptr)
+            x_gathered_offset = tl.load(fwd_x_gathered_offset_ptr)
+            scratch_bottom = scratch_grad_bottom
+
+        # No block-scaled backward GEMM consumes these descriptors. Keep the
+        # fixed activation-offset table valid for conditional NVFP4 forward
+        # recompute and H2 regeneration only.
+        x_col_offset = x_row_offset
+        h2_col_offset = h2_row_offset
+        grad_h3_col_offset = grad_h3_row_offset
+        dxy_col_offset = dxy_row_offset
+    elif native_backward:
         # Dense working set. The row bundles come from the forward's slot
         # offsets unless the forward is being rerun, in which case they and dense
         # h1 are rebuilt in the scratch row slot above this state.
@@ -1045,6 +1099,8 @@ def _triton_get_blockscaled_backward_plan(
     fwd_x_offset = tl.load(fwd_x_offset_ptr)
     if native_backward:
         saved_base = tl.load(fwd_x_row_offset_ptr)
+    elif save_dequantized_activations:
+        saved_base = tl.load(fwd_x_gathered_offset_ptr)
     else:
         saved_base = x_col_offset
     new_free_start = tl.where(need_recompute, fwd_x_offset, saved_base)
@@ -1070,20 +1126,27 @@ def _triton_get_blockscaled_backward_plan(
     else:
         x_mem_size = _tl_align(num_tokens * hidden_dim * element_size)
     h3_mem_size = _tl_align(num_tokens * topk * hidden_dim * element_size)
-    no_recompute_alloc_per_rank = _tl_blockscaled_no_recompute_alloc_per_rank(
-        rank_counts,
-        h3_mem_size,
-        hidden_dim,
-        intermediate_dim,
-        element_size,
-        operand_element_size,
-        operand_values_per_storage_element,
-        scale_element_size,
-        row_scale_storage_multiple,
-        row_global_scale_element_size,
-        sf_vec_size,
-        native_backward,
-    )
+    if save_dequantized_activations:
+        no_recompute_alloc_per_rank = (
+            _tl_align(rank_counts * hidden_dim * element_size)
+            + _tl_align(rank_counts * 2 * intermediate_dim * element_size)
+            + h3_mem_size
+        )
+    else:
+        no_recompute_alloc_per_rank = _tl_blockscaled_no_recompute_alloc_per_rank(
+            rank_counts,
+            h3_mem_size,
+            hidden_dim,
+            intermediate_dim,
+            element_size,
+            operand_element_size,
+            operand_values_per_storage_element,
+            scale_element_size,
+            row_scale_storage_multiple,
+            row_global_scale_element_size,
+            sf_vec_size,
+            native_backward,
+        )
     # Reverse the forward saved-bytes accounting for this layer (forward added
     # the same per-mode delta).
     output_bytes = tl.where(
