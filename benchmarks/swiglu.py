@@ -27,6 +27,10 @@ import torch
 import torch.distributed as dist
 
 ACTIVATIONS = ("swiglu", "swiglu_clamped", "situ_glu")
+NVFP4_STAGED = "nvfp4-staged"
+NVFP4_MEGA = "nvfp4-mega"
+NVFP4_PIPELINES = (NVFP4_STAGED, NVFP4_MEGA)
+PIPELINES = ("bf16", *NVFP4_PIPELINES)
 GRADIENT_INPUTS = ((0, "x_TD"), (2, "scores_TK"), (3, "w13_EFD"), (4, "w2_EDF"))
 
 
@@ -45,8 +49,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--intermediate", type=int, default=3072)
     parser.add_argument("--experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
-    parser.add_argument("--activation", choices=(*ACTIVATIONS, "all"), default="all")
-    parser.add_argument("--pipeline", choices=("bf16",), default="bf16")
+    parser.add_argument("--activation", choices=(*ACTIVATIONS, "all"))
+    parser.add_argument("--pipeline", choices=PIPELINES, default="bf16")
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--windows", type=int, default=5)
@@ -57,6 +61,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trace-dir", type=Path)
     parser.add_argument("--source-label", default="current")
     args = parser.parse_args(argv)
+    if args.activation is None:
+        args.activation = "swiglu" if args.pipeline in NVFP4_PIPELINES else "all"
     for field in (
         "tokens",
         "hidden",
@@ -73,6 +79,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--profile-steps cannot be negative")
     if args.top_k > args.experts:
         parser.error("--top-k cannot exceed --experts")
+    if args.pipeline in NVFP4_PIPELINES:
+        if args.activation == "all":
+            parser.error("NVFP4 activations must run in separate processes")
+        if args.activation == "situ_glu":
+            parser.error("SiTU-GLU currently supports BF16 execution only")
     return args
 
 
@@ -86,6 +97,12 @@ def make_config(args: argparse.Namespace, activation: str) -> dist_moe.Config:
     Returns:
         One-layer, one-slot training configuration without VMM.
     """
+    block_scaled = None
+    if args.pipeline in NVFP4_PIPELINES:
+        block_scaled = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+            pipeline=args.pipeline.removeprefix("nvfp4-"),
+        )
     return dist_moe.Config(
         max_num_local_input_tokens=args.tokens,
         hidden_dim=args.hidden,
@@ -98,6 +115,7 @@ def make_config(args: argparse.Namespace, activation: str) -> dist_moe.Config:
         device_scratch_capacity_factor=1.0,
         activation=activation,
         wgrad_dtype=torch.bfloat16,
+        block_scaled=block_scaled,
     )
 
 
