@@ -22,7 +22,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.testing._internal.distributed.fake_pg  # noqa: F401
-from quant_cast_bench.quant_cast_gold.recipes import nvfp4_gs_dq_f, nvfp4_gs_f
+from quant_cast_bench.quant_cast_gold.recipes import (
+    nvfp4_gs_dq_f,
+)
+from quant_cast_bench.quant_cast_gold.utils import (
+    f32_to_f4_unpacked,
+    pack_uint4,
+)
 from dist_moe._activation_buffer import (
     ActivationBuffer,
     BlockscaledStorageConfig,
@@ -56,7 +62,11 @@ from dist_moe._triton_ops import (
 from dist_moe.formats import (
     BlockScaledFormat as _KernelBlockScaledFormat,
     canonical_situ_glu,
+    E4M3_MIN_SUBNORMAL,
+    FP4_E2M1_MAX,
+    FP4_E2M1_MAX_RECIP,
     FP4_E2M1_TABLE,
+    FP8_E4M3_MAX,
     NVFP4_GLOBAL_SCALE_EPS,
     NVFP4_MAX,
     NVFP4_TOKEN_AMAX_FLOOR,
@@ -196,7 +206,7 @@ class _BackwardOpRecorder(TorchDispatchMode):
 
 
 class _NVFP4FakeQuantSTE(torch.autograd.Function):
-    """Apply the golden NVFP4 quantize-dequantize recipe with an STE."""
+    """Apply NVFP4 fake quantization with Dist-MoE's scale order and an STE."""
 
     @staticmethod
     def forward(
@@ -211,7 +221,11 @@ class _NVFP4FakeQuantSTE(torch.autograd.Function):
         flattened_outer_scale = (
             outer_scale.reshape(-1, 1) if outer_scale.ndim > 0 else outer_scale
         )
-        qdata, inner_scale = nvfp4_gs_f(flattened, flattened_outer_scale)
+        qdata, inner_scale = _nvfp4_quantize_dist_moe_scale_order(
+            flattened,
+            flattened_outer_scale,
+            blocked_scales=False,
+        )
         dequantized = nvfp4_gs_dq_f(qdata, inner_scale, flattened_outer_scale)
         return dequantized.reshape(original_shape)
 
@@ -224,12 +238,12 @@ class _NVFP4FakeQuantSTE(torch.autograd.Function):
         return grad_output.to(ctx.input_dtype), None
 
 
-def _nvfp4_fake_quant(
+def _nvfp4_outer_quant_scale(
     tensor: torch.Tensor,
     *,
     per_token: bool,
 ) -> torch.Tensor:
-    """Fake-quantize an NVFP4 operand with token- or tensor-level outer scale."""
+    """Return the golden NVFP4 outer quantization multiplier."""
     if per_token:
         amax = torch.linalg.vector_norm(
             tensor,
@@ -245,8 +259,176 @@ def _nvfp4_fake_quant(
             dim=tuple(range(tensor.ndim)),
             dtype=torch.float32,
         ).clamp(min=NVFP4_GLOBAL_SCALE_EPS)
-    outer_scale = NVFP4_MAX * torch.reciprocal(amax)
+    return NVFP4_MAX * torch.reciprocal(amax)
+
+
+def _nvfp4_fake_quant(
+    tensor: torch.Tensor,
+    *,
+    per_token: bool,
+) -> torch.Tensor:
+    """Fake-quantize an NVFP4 operand with token- or tensor-level outer scale."""
+    outer_scale = _nvfp4_outer_quant_scale(tensor, per_token=per_token)
     return _NVFP4FakeQuantSTE.apply(tensor, outer_scale)
+
+
+def _nvfp4_reference_to_blocked_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Convert natural scales to the blocked layout consumed by scaled_mm."""
+    rows, cols = scale.shape
+    row_blocks = (rows + 127) // 128
+    col_blocks = (cols + 3) // 4
+    padded_rows = row_blocks * 128
+    padded_cols = col_blocks * 4
+    if (rows, cols) != (padded_rows, padded_cols):
+        padded = scale.new_zeros((padded_rows, padded_cols))
+        padded[:rows, :cols] = scale
+        scale = padded
+    blocks = scale.view(row_blocks, 128, col_blocks, 4).permute(0, 2, 1, 3)
+    rearranged = blocks.reshape(row_blocks, col_blocks, 4, 32, 4).transpose(
+        -3,
+        -2,
+    )
+    return rearranged.reshape(row_blocks, col_blocks, 32, 16)
+
+
+def _nvfp4_quantize_dist_moe_scale_order(
+    tensor: torch.Tensor,
+    outer_scale: torch.Tensor,
+    *,
+    blocked_scales: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the golden NVFP4 cast with Dist-MoE's inner-scale operation order."""
+    rows, cols = tensor.shape
+    blocks = tensor.reshape(rows, cols // 16, 16)
+    outer = outer_scale.unsqueeze(-1) if outer_scale.ndim == 2 else outer_scale
+    local_amax = blocks.abs().amax(dim=-1, keepdim=True).to(torch.float32)
+    scaled_amax = local_amax * outer
+    inner_scale = torch.clamp(
+        scaled_amax * FP4_E2M1_MAX_RECIP,
+        min=E4M3_MIN_SUBNORMAL,
+        max=FP8_E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    reciprocal_scale = outer / inner_scale.to(torch.float32)
+    scaled_data = torch.clamp(
+        blocks.to(torch.float32) * reciprocal_scale,
+        min=-FP4_E2M1_MAX,
+        max=FP4_E2M1_MAX,
+    )
+    packed = pack_uint4(f32_to_f4_unpacked(scaled_data))
+    qdata = packed.view(torch.float4_e2m1fn_x2).reshape(rows, cols // 2)
+    natural_scale = inner_scale.squeeze(-1)
+    if blocked_scales:
+        return qdata, _nvfp4_reference_to_blocked_scale(natural_scale)
+    return qdata, natural_scale
+
+
+def _nvfp4_dist_moe_order_qdq(
+    tensor: torch.Tensor,
+    *,
+    per_token: bool,
+) -> torch.Tensor:
+    """Quantize-dequantize BF16 using Dist-MoE's inner-scale operation order."""
+    original_shape = tensor.shape
+    flattened = tensor.reshape(-1, original_shape[-1])
+    outer_scale = _nvfp4_outer_quant_scale(tensor, per_token=per_token)
+    flattened_outer_scale = (
+        outer_scale.reshape(-1, 1) if outer_scale.ndim > 0 else outer_scale
+    )
+    qdata, inner_scale = _nvfp4_quantize_dist_moe_scale_order(
+        flattened,
+        flattened_outer_scale,
+        blocked_scales=False,
+    )
+    dequantized = nvfp4_gs_dq_f(qdata, inner_scale, flattened_outer_scale)
+    return dequantized.reshape(original_shape).to(tensor.dtype)
+
+
+class _NVFP4RealQuantLinearSTE(torch.autograd.Function):
+    """Use a real NVFP4 forward GEMM and Q-DQ BF16 STE backward GEMMs."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        input_MK: torch.Tensor,
+        weight_NK: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate ``input_MK @ weight_NK.T`` with real NVFP4 tensor cores."""
+        if input_MK.ndim != 2 or weight_NK.ndim != 2:
+            raise ValueError("NVFP4 reference linear expects two-dimensional operands")
+        rows, contraction = input_MK.shape
+        output_features, weight_contraction = weight_NK.shape
+        if contraction != weight_contraction:
+            raise ValueError("NVFP4 reference linear contraction dimensions must match")
+        if contraction % 128 != 0 or output_features % 128 != 0:
+            raise ValueError(
+                "NVFP4 scaled_mm requires contraction and output dimensions "
+                "divisible by 128"
+            )
+
+        padded_rows = (rows + 127) // 128 * 128
+        padded_input = F.pad(input_MK, (0, 0, 0, padded_rows - rows))
+        input_outer_scale = _nvfp4_outer_quant_scale(
+            padded_input,
+            per_token=True,
+        )
+        weight_outer_scale = _nvfp4_outer_quant_scale(
+            weight_NK,
+            per_token=False,
+        )
+        input_q, input_inner_scale = _nvfp4_quantize_dist_moe_scale_order(
+            padded_input,
+            input_outer_scale,
+            blocked_scales=True,
+        )
+        weight_q, weight_inner_scale = _nvfp4_quantize_dist_moe_scale_order(
+            weight_NK,
+            weight_outer_scale,
+            blocked_scales=True,
+        )
+
+        accumulator = F.scaled_mm(
+            input_q,
+            weight_q.t(),
+            scale_a=input_inner_scale.flatten(),
+            scale_b=weight_inner_scale.flatten(),
+            scale_recipe_a=F.ScalingType.BlockWise1x16,
+            scale_recipe_b=F.ScalingType.BlockWise1x16,
+            swizzle_a=F.SwizzleType.SWIZZLE_32_4_4,
+            swizzle_b=F.SwizzleType.SWIZZLE_32_4_4,
+            output_dtype=torch.float32,
+        )
+        # scaled_mm cannot express BlockWise1x16 + RowWise today. Applying
+        # the separable outer scales after MMA matches Dist-MoE's FP32
+        # epilogue: per-row activation scale, then per-expert weight scale.
+        output = accumulator * torch.reciprocal(input_outer_scale)
+        output = output * torch.reciprocal(weight_outer_scale)
+        ctx.save_for_backward(input_MK, weight_NK)
+        return output[:rows].to(input_MK.dtype)
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_output_MN: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recreate Q-DQ operands and evaluate both gradients in BF16."""
+        input_MK, weight_NK = ctx.saved_tensors
+        input_qdq_MK = _nvfp4_dist_moe_order_qdq(input_MK, per_token=True)
+        weight_qdq_NK = _nvfp4_dist_moe_order_qdq(weight_NK, per_token=False)
+        grad_output_MN = grad_output_MN.to(input_MK.dtype).contiguous()
+        grad_input_MK = torch.mm(grad_output_MN, weight_qdq_NK)
+        grad_weight_NK = torch.mm(
+            grad_output_MN.t().contiguous(),
+            input_qdq_MK,
+        )
+        return grad_input_MK, grad_weight_NK
+
+
+def _nvfp4_real_quant_linear(
+    input_MK: torch.Tensor,
+    weight_NK: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the test-only real-NVFP4 linear with a BF16 STE backward."""
+    return _NVFP4RealQuantLinearSTE.apply(input_MK, weight_NK)
 
 
 def _dist_moe_nvfp4_activation_qdq(tensor: torch.Tensor) -> torch.Tensor:
@@ -460,6 +642,131 @@ def _reference_moe_nvfp4_fake_quant(
                 topk_ids.shape[1],
                 x.shape[1],
             ),
+        )
+    return torch.stack(outputs)
+
+
+def _reference_moe_nvfp4_real_quant(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_scores: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    experts_output_postprocess: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    clamped: bool = False,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    situ_glu: bool = False,
+    situ_glu_beta: float = 4.0,
+    situ_glu_linear_beta: float = 25.0,
+    saved_activations: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    """Evaluate routed experts with per-expert real NVFP4 forward GEMMs.
+
+    Args:
+        x: Input tokens with shape ``[T, D]``.
+        topk_ids: Expert IDs with shape ``[T, K]``.
+        topk_scores: Expert weights with shape ``[T, K]``.
+        w13: Fused gate/up weights with shape ``[E, 2F, D]``.
+        w2: Down-projection weights with shape ``[E, D, F]``.
+        experts_output_postprocess: Optional route-wise output transform.
+        clamped: Whether to apply the clamped SwiGLU formula.
+        swiglu_alpha: Sigmoid multiplier for clamped SwiGLU.
+        swiglu_limit: Preactivation bound for clamped SwiGLU.
+        situ_glu: Whether to apply the SiTU-GLU formula.
+        situ_glu_beta: Gate tanh bound for SiTU-GLU.
+        situ_glu_linear_beta: Up-projection tanh bound for SiTU-GLU.
+        saved_activations: Optional output dictionary populated with
+            expert-grouped ``x_bw`` and ``h1`` rows plus route-ordered ``h3``.
+
+    Returns:
+        Real-quantized reference output with shape ``[T, D]``.
+    """
+    output_dtype = x.dtype
+    num_tokens, hidden_dim = x.shape
+    top_k = topk_ids.shape[1]
+    num_experts = w13.shape[0]
+    intermediate_dim = w2.shape[2]
+    flat_ids = topk_ids.reshape(-1)
+    flat_token_indices = (
+        torch.arange(num_tokens, device=x.device)[:, None]
+        .expand(num_tokens, top_k)
+        .reshape(-1)
+    )
+    route_h3: list[torch.Tensor] = [
+        x.new_zeros(hidden_dim, dtype=output_dtype) for _ in range(flat_ids.numel())
+    ]
+    x_bw_by_expert: list[torch.Tensor] = []
+    h1_by_expert: list[torch.Tensor] = []
+
+    for expert in range(num_experts):
+        route_indices = torch.nonzero(flat_ids == expert).flatten()
+        if route_indices.numel() == 0:
+            x_bw_by_expert.append(x.new_empty((0, hidden_dim), dtype=output_dtype))
+            h1_by_expert.append(
+                x.new_empty((0, 2 * intermediate_dim), dtype=output_dtype)
+            )
+            continue
+
+        token_indices = flat_token_indices.index_select(0, route_indices)
+        expert_x = x.index_select(0, token_indices)
+        h13 = _nvfp4_real_quant_linear(expert_x, w13[expert])
+        h1_by_expert.append(h13)
+        if saved_activations is not None:
+            x_bw_by_expert.append(_nvfp4_dist_moe_order_qdq(expert_x, per_token=True))
+        else:
+            x_bw_by_expert.append(x.new_empty((0, hidden_dim), dtype=output_dtype))
+
+        gate, up = h13.split(intermediate_dim, dim=-1)
+        gate_f32, up_f32 = gate.float(), up.float()
+        if clamped:
+            gate_f32 = torch.minimum(
+                gate_f32,
+                gate_f32.new_tensor(swiglu_limit),
+            )
+            up_f32 = torch.clamp(
+                up_f32,
+                min=-swiglu_limit,
+                max=swiglu_limit,
+            )
+            h2 = (
+                gate_f32 * torch.sigmoid(swiglu_alpha * gate_f32) * (up_f32 + 1.0)
+            ).to(output_dtype)
+        elif situ_glu:
+            gate_f32 = (
+                situ_glu_beta
+                * torch.tanh(gate_f32 / situ_glu_beta)
+                * torch.sigmoid(gate_f32)
+            )
+            up_f32 = situ_glu_linear_beta * torch.tanh(up_f32 / situ_glu_linear_beta)
+            h2 = (gate_f32 * up_f32).to(output_dtype)
+        else:
+            h2 = (gate_f32 * torch.sigmoid(gate_f32) * up_f32).to(output_dtype)
+        expert_h3 = _nvfp4_real_quant_linear(h2, w2[expert])
+        for route_index, h3 in zip(
+            route_indices.tolist(),
+            expert_h3.unbind(),
+            strict=True,
+        ):
+            route_h3[route_index] = h3
+
+    route_h3_TKD = torch.stack(route_h3).view(num_tokens, top_k, hidden_dim)
+    outputs = []
+    for token_index in range(num_tokens):
+        stacked = route_h3_TKD[token_index]
+        if experts_output_postprocess is not None:
+            stacked = experts_output_postprocess(stacked)
+        outputs.append(
+            torch.sum(stacked.float() * topk_scores[token_index, :, None], dim=0).to(
+                output_dtype
+            )
+        )
+    if saved_activations is not None:
+        saved_activations.update(
+            x_bw_by_expert=tuple(x_bw_by_expert),
+            h1_by_expert=tuple(h1_by_expert),
+            h3=route_h3_TKD,
         )
     return torch.stack(outputs)
 
@@ -3496,13 +3803,191 @@ class DistMoeKernelTest(unittest.TestCase):
                     )
                 torch.testing.assert_close(actual_TD, expected_TD, rtol=0, atol=0)
 
-    def test_nvfp4_training_backward_matches_fake_quant_reference(self) -> None:
-        """Match NVFP4 STE gradients for staged/Mega and save/recompute.
+    def test_nvfp4_reference_scale_order_matches_dist_moe_quantization(self) -> None:
+        """Match inlined reference qdata and scales for both scale granularities.
 
-        Relative-L2 bounds cover real tensor-core MMA versus the reference's
-        ``F.linear`` accumulation order. All four gradients are checked so W13
-        and W2 prove the saved X_bw and regenerated Q-DQ H2 operands,
-        respectively, while input DGRAD proves requantized/dequantized weights.
+        Bitwise activation and weight operands prove that multiplying by the
+        outer scale before rounded ``1/6`` reproduces Dist-MoE's per-token and
+        per-expert quantizers independently of the later GEMM comparison.
+        """
+        generator = torch.Generator(device="cuda").manual_seed(20261103)
+        activation_MD = torch.randn(
+            35,
+            256,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        actual_q_MQ, actual_scale_MB, actual_scale_inv_M = (
+            blockscaled_impl._quantize_nvfp4_per_token(
+                activation_MD,
+                layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
+            )
+        )
+        activation_outer_scale_M1 = _nvfp4_outer_quant_scale(
+            activation_MD,
+            per_token=True,
+        )
+        expected_q_MQ, expected_scale_MB = _nvfp4_quantize_dist_moe_scale_order(
+            activation_MD,
+            activation_outer_scale_M1,
+            blocked_scales=False,
+        )
+        expected_scale_inv_M = torch.div(
+            torch.ones_like(activation_outer_scale_M1[:, 0]),
+            activation_outer_scale_M1[:, 0],
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_q_MQ.view(torch.uint8),
+                expected_q_MQ.view(torch.uint8),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_scale_MB.view(torch.uint8),
+                expected_scale_MB.view(torch.uint8),
+            )
+        )
+        self.assertTrue(torch.equal(actual_scale_inv_M, expected_scale_inv_M))
+
+        weight_ENK = torch.randn(
+            2,
+            256,
+            256,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        actual_q_ENQ, actual_scale_RB, _, _ = (
+            blockscaled_impl._prepare_nvfp4_weight_operands(weight_ENK)
+        )
+        expected_q = []
+        expected_scale = []
+        for expert_NK in weight_ENK:
+            outer_scale = _nvfp4_outer_quant_scale(
+                expert_NK,
+                per_token=False,
+            )
+            qdata_NQ, scale_RB = _nvfp4_quantize_dist_moe_scale_order(
+                expert_NK,
+                outer_scale,
+                blocked_scales=True,
+            )
+            expected_q.append(qdata_NQ)
+            expected_scale.append(scale_RB.flatten())
+        expected_q_ENQ = torch.stack(expected_q)
+        expected_scale_RB = torch.cat(expected_scale).view_as(actual_scale_RB)
+        self.assertTrue(
+            torch.equal(
+                actual_q_ENQ.view(torch.uint8),
+                expected_q_ENQ.view(torch.uint8),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_scale_RB.view(torch.uint8),
+                expected_scale_RB.view(torch.uint8),
+            )
+        )
+
+    def test_nvfp4_real_quant_linear_pads_and_uses_bf16_backward(self) -> None:
+        """Pad real NVFP4 MMA while retaining Q-DQ BF16 STE gradients.
+
+        Route counts on both sides of the 128-row boundary prove that padding
+        is internal to the reference. The forward comparison allows only MMA
+        accumulation-order error, while both backward GEMMs are bitwise equal
+        to their explicit inlined Q-DQ formulas.
+        """
+        generator = torch.Generator(device="cuda").manual_seed(20261103)
+        for rows in (5, 129):
+            with self.subTest(rows=rows):
+                input_MK = torch.randn(
+                    rows,
+                    256,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                    generator=generator,
+                    requires_grad=True,
+                )
+                weight_NK = torch.randn(
+                    256,
+                    256,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                    generator=generator,
+                    requires_grad=True,
+                )
+                with mock.patch.object(
+                    F,
+                    "scaled_mm",
+                    wraps=F.scaled_mm,
+                ) as scaled_mm:
+                    actual_MN = _nvfp4_real_quant_linear(input_MK, weight_NK)
+
+                self.assertEqual(scaled_mm.call_count, 1)
+                mat_a, mat_b = scaled_mm.call_args.args
+                expected_rows = (rows + 127) // 128 * 128
+                self.assertEqual(mat_a.shape, (expected_rows, 128))
+                self.assertEqual(mat_b.shape, (128, 256))
+                self.assertIs(mat_a.dtype, torch.float4_e2m1fn_x2)
+                self.assertIs(mat_b.dtype, torch.float4_e2m1fn_x2)
+                self.assertIs(
+                    scaled_mm.call_args.kwargs["output_dtype"],
+                    torch.float32,
+                )
+                self.assertEqual(actual_MN.shape, (rows, 256))
+
+                input_qdq_MK = _nvfp4_dist_moe_order_qdq(
+                    input_MK.detach(),
+                    per_token=True,
+                )
+                weight_qdq_NK = _nvfp4_dist_moe_order_qdq(
+                    weight_NK.detach(),
+                    per_token=False,
+                )
+                bf16_reference_MN = F.linear(input_qdq_MK, weight_qdq_NK)
+                self.assertLess(
+                    _relative_l2(actual_MN, bf16_reference_MN),
+                    0.01,
+                )
+
+                grad_output_MN = torch.randn(
+                    actual_MN.shape,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                    generator=generator,
+                )
+                expected_input_grad_MK = torch.mm(
+                    grad_output_MN,
+                    weight_qdq_NK,
+                )
+                expected_weight_grad_NK = torch.mm(
+                    grad_output_MN.t().contiguous(),
+                    input_qdq_MK,
+                )
+                actual_MN.backward(grad_output_MN)
+                assert input_MK.grad is not None
+                assert weight_NK.grad is not None
+                torch.testing.assert_close(
+                    input_MK.grad,
+                    expected_input_grad_MK,
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    weight_NK.grad,
+                    expected_weight_grad_NK,
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_nvfp4_training_backward_matches_real_quant_reference(self) -> None:
+        """Match real-NVFP4 forward and BF16 STE backward for every path.
+
+        Matching Dist-MoE's inner-scale operation order makes forward, input
+        DGRAD, and W13 WGRAD bitwise identical. Score reduction and W2 WGRAD
+        retain only tightly bounded reduction-scheduling differences.
         """
         for pipeline in ("staged", "mega"):
             policy = dist_moe.BlockScaledConfig(
@@ -3556,7 +4041,7 @@ class DistMoeKernelTest(unittest.TestCase):
                         actual[3],
                         context,
                     )
-                    reference_TD = _reference_moe_nvfp4_fake_quant(
+                    reference_TD = _reference_moe_nvfp4_real_quant(
                         reference[0],
                         ids_TK,
                         reference[1],
@@ -3569,8 +4054,20 @@ class DistMoeKernelTest(unittest.TestCase):
                     assert context.activation_buffer is not None
                     self._assert_planner_reset(context.activation_buffer)
 
-                    self.assertLess(_relative_l2(actual_TD, reference_TD), 0.04)
-                    for actual_input, reference_input in zip(
+                    torch.testing.assert_close(
+                        actual_TD,
+                        reference_TD,
+                        rtol=0,
+                        atol=0,
+                    )
+                    gradient_bounds = {
+                        "x": 0.0,
+                        "topk_scores": 1e-6,
+                        "w13": 0.0,
+                        "w2": 5e-4,
+                    }
+                    for name, actual_input, reference_input in zip(
+                        gradient_bounds,
                         actual,
                         reference,
                         strict=True,
@@ -3579,13 +4076,22 @@ class DistMoeKernelTest(unittest.TestCase):
                         self.assertIsNotNone(reference_input.grad)
                         assert actual_input.grad is not None
                         assert reference_input.grad is not None
-                        self.assertLess(
-                            _relative_l2(
+                        bound = gradient_bounds[name]
+                        if bound == 0.0:
+                            torch.testing.assert_close(
                                 actual_input.grad,
                                 reference_input.grad,
-                            ),
-                            0.04,
-                        )
+                                rtol=0,
+                                atol=0,
+                            )
+                        else:
+                            self.assertLess(
+                                _relative_l2(
+                                    actual_input.grad,
+                                    reference_input.grad,
+                                ),
+                                bound,
+                            )
 
     def test_nvfp4_training_rejects_prepared_weights(self) -> None:
         """Keep prepared NVFP4 operands inference-only after enabling training."""
@@ -3619,10 +4125,10 @@ class DistMoeKernelTest(unittest.TestCase):
 
         Staged and Mega must preserve their current output bitwise. The saved
         ``X_bw``, ``H1``, and ``H3`` are compared with the fake-quantized
-        reference at tight bounds; its gold quantizer can make different
-        boundary choices, and it uses ``F.linear`` rather than real NVFP4
-        tensor-core MMA. X_bw is also checked bitwise against Dist-MoE's
-        independent per-token Q-DQ primitive.
+        reference at tight bounds. Its packed values and scales match Dist-MoE,
+        but it uses ``F.linear`` rather than real NVFP4 tensor-core MMA. X_bw is
+        also checked bitwise against Dist-MoE's independent per-token Q-DQ
+        primitive.
         Guard bytes and empty weight-state slots prove that H2 and quantized
         tensors do not persist in the activation slot or fixed state schema.
         """
@@ -3745,25 +4251,25 @@ class DistMoeKernelTest(unittest.TestCase):
                     )
                     self.assertLess(
                         torch.max(torch.abs(actual_x - expected_x)).item(),
-                        3.5e-2,
+                        2e-3,
                     )
                     self.assertLess(
                         _relative_l2(actual_x, expected_x),
-                        1e-2,
+                        4e-4,
                     )
                     self.assertGreater(
                         _cosine_similarity(actual_x, expected_x),
-                        0.9999,
+                        0.999999,
                     )
                     actual_h1 = h1_M2F[cursor : cursor + active_rows]
                     expected_h1 = expected_h1_by_expert[expert]
                     self.assertLess(
                         _relative_l2(actual_h1, expected_h1),
-                        1.5e-2,
+                        5e-5,
                     )
                     self.assertGreater(
                         _cosine_similarity(actual_h1, expected_h1),
-                        0.9999,
+                        0.999999,
                     )
                     self.assertEqual(
                         torch.count_nonzero(
@@ -3782,16 +4288,16 @@ class DistMoeKernelTest(unittest.TestCase):
                 torch.testing.assert_close(
                     h3_TKD,
                     reference_state["h3"],
-                    rtol=2e-2,
-                    atol=2.5e-3,
+                    rtol=5e-3,
+                    atol=8e-6,
                 )
                 self.assertLess(
                     _relative_l2(h3_TKD, reference_state["h3"]),
-                    3e-2,
+                    1e-5,
                 )
                 self.assertGreater(
                     _cosine_similarity(h3_TKD, reference_state["h3"]),
-                    0.9995,
+                    0.999999,
                 )
 
                 saved_end = int(activation_buffer.buffer_offsets[0].item())
@@ -6742,22 +7248,27 @@ class DistMoeTwoRankTest(unittest.TestCase):
     def test_nvfp4_inference_exercises_peer_paths_fq(self) -> None:
         """Tightly bound prepared NVFP4 against its fake-quantized reference.
 
-        The reference dequantizes its operands and evaluates each GEMM with
-        ``F.linear``, while Dist-MoE executes real NVFP4 tensor-core compute.
-        Their accumulation and scale-application orders are therefore not
-        bitwise equivalent, so the comparison uses calibrated tolerances:
-        Require 1%/0.002 elementwise error, 2.5% relative L2, and 0.9997 cosine.
+        The reference matches Dist-MoE's packed values and scales, dequantizes
+        its operands, and evaluates each GEMM with ``F.linear``. Dist-MoE uses
+        real NVFP4 tensor-core compute, so accumulation remains non-bitwise:
+        require 0.5%/6.2e-5 elementwise error, 0.025% relative L2, and
+        0.999999 cosine.
         """
         self._run_two_rank_numerics(
             dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4),
             inference=True,
             reference_moe=_reference_moe_nvfp4_fake_quant,
-            fwd_tolerance_override=(0.01, 0.002, 0.025, 0.9997),
+            fwd_tolerance_override=(0.005, 6.2e-5, 2.5e-4, 0.999999),
         )
 
     @with_comms
     def test_nvfp4_forward_and_backward_exercise_peer_paths(self) -> None:
-        """Bound eager NVFP4 output and STE gradients over real peer paths."""
+        """Tightly bound real NVFP4 and BF16 STE gradients over peer paths.
+
+        Matching the inner-scale operation order reduces the forward
+        relative-L2 limit from 4% to 0.002% and every gradient limit to 0.05%.
+        Elementwise bounds retain headroom for near-zero reduction results.
+        """
         for pipeline in ("staged", "mega"):
             with self.subTest(pipeline=pipeline):
                 preprocess_calls: list[torch.Size] = []
@@ -6787,9 +7298,9 @@ class DistMoeTwoRankTest(unittest.TestCase):
                             weights_preprocess_fn=preprocess_weight,
                             wgrad_postprocess_fn=record_wgrad,
                         ),
-                        reference_moe=_reference_moe_nvfp4_fake_quant,
-                        fwd_tolerance_override=(0.02, 0.004, 0.04, 0.999),
-                        grad_tolerance_override=(0.2, 0.04, 0.04, 0.999),
+                        reference_moe=_reference_moe_nvfp4_real_quant,
+                        fwd_tolerance_override=(0.005, 3.1e-5, 2e-5, 0.999999),
+                        grad_tolerance_override=(0.01, 0.002, 5e-4, 0.999999),
                     )
                 self.assertEqual(len(preprocess_calls), 4)
                 self.assertEqual(prepare_weight.call_count, 4)
@@ -6819,8 +7330,8 @@ class DistMoeTwoRankTest(unittest.TestCase):
             ),
             reference_moe=_reference_moe_nvfp4_fake_quant,
             reference_postprocess_fn=reference_rmsnorm,
-            fwd_tolerance_override=(0.02, 0.004, 0.04, 0.999),
-            grad_tolerance_override=(0.2, 0.04, 0.05, 0.998),
+            fwd_tolerance_override=(0.01, 0.002, 3e-4, 0.999999),
+            grad_tolerance_override=(0.1, 0.02, 6e-3, 0.99998),
         )
 
     @with_comms
@@ -6960,15 +7471,15 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 )
                 self.assertLess(
                     torch.max(torch.abs(actual - expected)).item(),
-                    6e-2,
+                    2e-3,
                 )
                 self.assertLess(
                     _relative_l2(actual, expected),
-                    1e-2,
+                    4e-4,
                 )
                 self.assertGreater(
                     _cosine_similarity(actual, expected),
-                    0.9999,
+                    0.999999,
                 )
                 self.assertEqual(
                     torch.count_nonzero(
