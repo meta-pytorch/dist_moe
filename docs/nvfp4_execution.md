@@ -16,6 +16,7 @@ NVFP4 uses only forward propagation (**FPROP**). It has no input-gradient
 - [Follow the forward pass](#follow-the-forward-pass)
 - [Understand the packed dispatch row](#understand-the-packed-dispatch-row)
 - [Choose staged or Mega](#choose-staged-or-mega)
+- [Run weight-only W4A16 Mega](#weight-only-w4a16-mega)
 - [Capture and replay CUDA graphs](#capture-and-replay-cuda-graphs)
 - [Understand failure boundaries](#understand-failure-boundaries)
 
@@ -243,6 +244,57 @@ to make an unsupported shape run.
 Neither path saves activations, routing snapshots, DGRAD operands, or WGRAD
 operands for backward. The returned BF16 output is the only user-visible
 result.
+
+<a id="weight-only-w4a16-mega"></a>
+## Run weight-only W4A16 Mega
+
+`weight_only=True` keeps activations in BF16 and reads the prepared NVFP4
+weights, decoding them to BF16 inside the GEMM (W4A16). Dispatch publishes
+BF16 rows, and one fused kernel runs the gather, W13 with SwiGLU, W2 and the
+combine scatter. The fragment below replaces the NVFP4 policy and weight
+preparation above:
+
+```python
+policy = dist_moe.BlockScaledConfig(
+    format=dist_moe.BlockScaledFormat.NVFP4,
+    pipeline="mega",
+    weight_only=True,
+)
+prepared_w13 = dist_moe.prepare_block_scaled_weight(
+    w13_E2FD.flatten(1, 2), policy, inference=True, fuse_swiglu=True
+)
+prepared_w2 = dist_moe.prepare_block_scaled_weight(w2_EDF, policy, inference=True)
+```
+
+Beyond the NVFP4 contract, the mode accepts only plain SwiGLU, device-only
+scratch (`vmm=None`) and automatic tiles (no `kernel_config`); configuration
+rejects the rest. W13 must be prepared with `fuse_swiglu=True`, and a call
+with concatenated W13 raises before any kernel launch. Prepared weights are
+the same NVFP4 operands as above, 0.5625 bytes per weight plus one FP32
+global scale and its reciprocal per expert.
+
+The forward crosses the same registered operation:
+
+| Phase | Callable | Effect |
+| --- | --- | --- |
+| 1 | `copy_routing`, `_stage_async_inference_dispatch` | publish expert IDs and copy BF16 `x_TD` into the local symmetric dispatch buffer, without quantization |
+| 2 | `_ep_barrier` | make routing and dispatch rows visible to peers |
+| 3 | `dist_dispatch_routing` | per-expert counts, gather pointers and scatter pointers; rows are unpadded (`m_multiple_of=1`) |
+| 4 | `w4a16_mega_fprop` | one W4A16 Mega launch over static views of context scratch: gather, W13 + SwiGLU, W2, peer combine stores |
+| 5 | `_ep_barrier` | make every rank's combine stores visible |
+| 6 | `_scale_and_sum` | score-weighted top-k reduction of the route rows to BF16 `y_TD`, masking inactive routes |
+
+The memory plan's `inference_operand_bytes` is exactly
+`w4a16_mega_operand_bytes()` at the padded receive capacity: the gathered BF16
+rows, the BF16 SwiGLU rows and the kernel's readiness counters. Phase 4 uses
+that region of the activation buffer and allocates nothing. See
+[W4A16 Mega inference](nvfp4_kernel_design.md#w4a16-mega-inference) for the
+kernel.
+
+For CUDA graphs, refresh weights by copying newly prepared `fprop_data`,
+`fprop_scale`, `global_scale` and `global_scale_inv` into the captured
+prepared tensors in place; replay reads them at the captured addresses.
+`benchmarks/w4a16_mega.py` times one layer per format through this API.
 
 <a id="capture-and-replay-cuda-graphs"></a>
 ## Capture and replay CUDA graphs

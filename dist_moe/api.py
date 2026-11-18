@@ -265,18 +265,26 @@ class BlockScaledConfig:
             DGRAD/WGRAD pair; NVFP4 remains forward-only.
         kernel_config: Optional expert pipeline override; ``None`` selects the
             shape-aware defaults.
+        weight_only: NVFP4 Mega inference only: keep activations in BF16
+            (W4A16). Weights are prepared as for NVFP4, with W13 prepared by
+            ``fuse_swiglu=True``; one fused kernel runs dispatch, FC13 +
+            SwiGLU, FC2 and combine, decoding the weights to BF16 in tensor
+            memory. It selects its own tiles (no ``kernel_config``) and
+            supports plain SwiGLU with device-only scratch (``vmm=None``).
     """
 
     format: BlockScaledFormat = BlockScaledFormat.MXFP8_E4M3
     fast_math: bool = False
     pipeline: Literal["staged", "mega"] = "staged"
     kernel_config: BlockScaledKernelConfig | None = None
+    weight_only: bool = False
 
     def __post_init__(self) -> None:
         """Validate the supported public precision surface.
 
         Raises:
-            ValueError: If the format or fast-math combination is unsupported.
+            ValueError: If the format, fast-math, pipeline, weight-only, or
+                kernel-config combination is unsupported.
         """
         supported = {
             BlockScaledFormat.MXFP8_E4M3,
@@ -288,6 +296,12 @@ class BlockScaledConfig:
             raise ValueError("fast_math is supported only by the MXFP8 fused path")
         if self.pipeline not in ("staged", "mega"):
             raise ValueError("block-scaled pipeline must be 'staged' or 'mega'")
+        if self.weight_only and (
+            self.format is not BlockScaledFormat.NVFP4 or self.pipeline != "mega"
+        ):
+            raise ValueError("weight_only (W4A16) requires NVFP4 and pipeline='mega'")
+        if self.weight_only and self.kernel_config is not None:
+            raise ValueError("weight_only (W4A16) does not accept a kernel_config")
         if self.kernel_config is not None:
             expected_k = 128
             if self.kernel_config.block_k != expected_k:
@@ -543,6 +557,18 @@ class Config:
             and self.block_scaled.format is not BlockScaledFormat.MXFP8_E4M3
         ):
             raise ValueError("block-scaled SiTU-GLU supports MXFP8 E4M3 only")
+        if (
+            self.block_scaled is not None
+            and self.block_scaled.weight_only
+            and self.activation != "swiglu"
+        ):
+            raise ValueError("weight_only (W4A16) supports plain SwiGLU only")
+        if (
+            self.block_scaled is not None
+            and self.block_scaled.weight_only
+            and self.vmm is not None
+        ):
+            raise ValueError("weight_only (W4A16) requires device-only scratch")
         if self.block_scaled is not None:
             _validate_block_scaled_config(self)
 

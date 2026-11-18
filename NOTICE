@@ -20,3 +20,13 @@ Copyright (c) 2025-2026, Vijay Thakkar, Tri Dao.
 
 Quack is licensed under the Apache License, Version 2.0. A copy of that
 license is provided in LICENSES/Apache-2.0.txt.
+
+This product includes modified portions of FlashInfer
+(https://github.com/flashinfer-ai/flashinfer):
+
+  dist_moe/kernels/_nvfp4_decode.py
+
+Copyright (c) 2026 FlashInfer contributors.
+
+FlashInfer is licensed under the Apache License, Version 2.0. A copy of that
+license is provided in LICENSES/Apache-2.0.txt.

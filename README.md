@@ -32,6 +32,7 @@ graph-stable PyTorch operations needed to execute routed experts.
 | BF16 | Standard | Yes | Yes |
 | MXFP8 E4M3 | Staged or Mega | Yes | Yes |
 | NVFP4 | Staged or Mega | No | Yes |
+| NVFP4 weights, BF16 activations (W4A16) | Mega | No | Yes |
 
 All supported modes work with non-strict `make_fx`, CUDA graphs, and optional
 VMM host-backed scratch. Training modes include forward and backward.
@@ -383,6 +384,11 @@ config = dist_moe.Config(
 ```
 
 See [NVFP4 inference](docs/nvfp4_execution.md).
+
+`weight_only=True` with `pipeline="mega"` keeps BF16 activations and decodes
+the prepared NVFP4 weights to BF16 inside one fused dispatch, W13, SwiGLU, W2
+and combine kernel (W4A16). Prepare W13 with `fuse_swiglu=True`; see
+[weight-only W4A16 Mega](docs/nvfp4_execution.md#weight-only-w4a16-mega).
 
 <a id="plan-memory"></a>
 ## Plan memory

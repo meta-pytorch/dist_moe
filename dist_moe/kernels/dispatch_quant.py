@@ -1186,6 +1186,7 @@ def _dispatch_gather_producer_body(  # noqa: C901
     gather_columns: cutlass.Constexpr[bool] = False,
     K_SEGMENTS: cutlass.Constexpr[int] = 1,
     M_INTERLEAVE: cutlass.Constexpr[int] = 0,
+    THREAD_BASE: cutlass.Constexpr[int] = -1,
 ) -> None:
     """Gather producer body (GATHER WG, 128 threads): pulls A from
     peer GPUs via per-row pointer indirection, signals per-M-tile
@@ -1204,7 +1205,12 @@ def _dispatch_gather_producer_body(  # noqa: C901
     item covers one segment and signals once, at its end."""
     assert not (gather_columns and K_SEGMENTS > 1), "column gather has no K split"
     tidx, _, _ = cute.arch.thread_idx()
-    lane = tidx % cutlass.Int32(128)
+    # THREAD_BASE >= 0: the gather threads are [THREAD_BASE, THREAD_BASE +
+    # _DIST_GATHER_WG_THREADS); otherwise one aligned 128-thread warpgroup.
+    if cutlass.const_expr(THREAD_BASE >= 0):
+        lane = tidx - cutlass.Int32(THREAD_BASE)
+    else:
+        lane = tidx % cutlass.Int32(128)
     gemm_m_idx = cutlass.Int32(0)
     sub_offset = cutlass.Int32(0)
 
