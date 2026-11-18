@@ -94,6 +94,7 @@ __all__ = [
     "create_context",
     "plan_memory",
     "prepare_block_scaled_weight",
+    "quantize_dequantize_weight",
     "RMSNormPostprocess",
     "routed_experts",
     "supports_fused_post_expert_rmsnorm",
@@ -254,7 +255,8 @@ class BlockScaledConfig:
     """CuTe block-scaled compute policy for a distributed MoE context.
 
     Args:
-        format: MXFP8 E4M3 training/inference or NVIDIA FP4 inference operands.
+        format: MXFP8 E4M3 training/inference or NVIDIA FP4 inference operands
+            (NVFP4 also trains with ``weight_only``).
         fast_math: Whether MXFP8 fused SwiGLU uses approximate sigmoid math.
             SiTU-GLU tanhs remain precise. Its default gate bound of four
             reuses that tanh for sigmoid regardless of this flag; other bounds
@@ -265,12 +267,15 @@ class BlockScaledConfig:
             DGRAD/WGRAD pair; NVFP4 remains forward-only.
         kernel_config: Optional expert pipeline override; ``None`` selects the
             shape-aware defaults.
-        weight_only: NVFP4 Mega inference only: keep activations in BF16
-            (W4A16). Weights are prepared as for NVFP4, with W13 prepared by
-            ``fuse_swiglu=True``; one fused kernel runs dispatch, FC13 +
-            SwiGLU, FC2 and combine, decoding the weights to BF16 in tensor
-            memory. It selects its own tiles (no ``kernel_config``) and
-            supports plain SwiGLU with device-only scratch (``vmm=None``).
+        weight_only: NVFP4 weights with BF16 activations (W4A16), quantized
+            with Four Over Six (see :func:`quantize_dequantize_weight`).
+            Requires ``pipeline="mega"``. Inference runs one fused kernel for
+            dispatch, FC13 + SwiGLU, FC2 and combine on prepared weights (W13
+            by ``fuse_swiglu=True``), decoding them to BF16 in tensor memory;
+            it selects its own tiles (no ``kernel_config``) and supports plain
+            SwiGLU with device-only scratch (``vmm=None``). Training runs the
+            BF16 kernels on the fake-quantized weights and passes their
+            gradients straight through to the BF16 weights.
     """
 
     format: BlockScaledFormat = BlockScaledFormat.MXFP8_E4M3
@@ -331,9 +336,11 @@ def _validate_block_scaled_config(config: Config) -> None:
             f"by the format vector size {vector_size}"
         )
     if policy.format is BlockScaledFormat.NVFP4:
-        if not config.inference:
-            raise ValueError("NVFP4 DistMoE is inference-only")
-        if (
+        if not config.inference and not policy.weight_only:
+            raise ValueError("NVFP4 DistMoE is inference-only unless weight_only")
+        # Weight-only training runs the BF16 kernels; its fake quantization
+        # needs only the vector-size divisibility above.
+        if config.inference and (
             config.hidden_dim % _NVFP4_DIM_MULTIPLE
             or config.intermediate_dim % _NVFP4_DIM_MULTIPLE
             or config.hidden_dim > _NVFP4_HIDDEN_DIM_MAX
@@ -387,6 +394,8 @@ class Config:
             WGRAD presets. During inference it leaves kernel selection to the
             shape-aware launcher.
         block_scaled: Optional MXFP8/NVFP4 compute policy. ``None`` selects BF16.
+            Weight-only NVFP4 training runs the BF16 kernels on fake-quantized
+            weights.
         activation: Gated activation. ``"swiglu_clamped"`` selects
             ``min(gate, limit) * sigmoid(alpha * min(gate, limit)) *
             (clamp(up, -limit, limit) + 1)``. ``"situ_glu"`` selects
@@ -558,17 +567,21 @@ class Config:
         ):
             raise ValueError("block-scaled SiTU-GLU supports MXFP8 E4M3 only")
         if (
-            self.block_scaled is not None
+            self.inference
+            and self.block_scaled is not None
             and self.block_scaled.weight_only
             and self.activation != "swiglu"
         ):
-            raise ValueError("weight_only (W4A16) supports plain SwiGLU only")
+            raise ValueError("weight_only (W4A16) inference supports plain SwiGLU only")
         if (
-            self.block_scaled is not None
+            self.inference
+            and self.block_scaled is not None
             and self.block_scaled.weight_only
             and self.vmm is not None
         ):
-            raise ValueError("weight_only (W4A16) requires device-only scratch")
+            raise ValueError(
+                "weight_only (W4A16) inference requires device-only scratch"
+            )
         if self.block_scaled is not None:
             _validate_block_scaled_config(self)
 
@@ -834,6 +847,22 @@ def _resolve_cuda_device(
     return resolved
 
 
+def _runs_block_scaled_kernels(config: Config) -> bool:
+    """Return whether a context executes its block-scaled policy's kernels.
+
+    Weight-only training runs the BF16 kernels on fake-quantized weights, so it
+    plans and executes as BF16.
+
+    Args:
+        config: Public distributed MoE configuration.
+
+    Returns:
+        ``True`` unless the policy is absent or weight-only training.
+    """
+    policy = config.block_scaled
+    return policy is not None and (config.inference or not policy.weight_only)
+
+
 def _model_config(
     config: Config,
     *,
@@ -857,21 +886,22 @@ def _model_config(
     block_scaled_storage = None
     routing_m_multiple = None
     num_local_experts = 1 if ep_size is None else config.num_experts // ep_size
-    if config.block_scaled is not None:
+    policy = config.block_scaled if _runs_block_scaled_kernels(config) else None
+    if policy is not None:
         if ep_size is None:
             raise ValueError("ep_size is required for block-scaled memory planning")
         operand_dtype, scale_dtype, sf_vec_size = block_scaled_format_constants(
-            _kernel_block_scaled_format(config.block_scaled.format)
+            _kernel_block_scaled_format(policy.format)
         )
         block_scaled_storage = BlockscaledStorageConfig(
             operand_element_size=operand_dtype.itemsize,
             scale_element_size=scale_dtype.itemsize,
             sf_vec_size=sf_vec_size,
             operand_values_per_storage_element=(
-                2 if config.block_scaled.format is BlockScaledFormat.NVFP4 else 1
+                2 if policy.format is BlockScaledFormat.NVFP4 else 1
             ),
             row_global_scale_element_size=(
-                4 if config.block_scaled.format is BlockScaledFormat.NVFP4 else 0
+                4 if policy.format is BlockScaledFormat.NVFP4 else 0
             ),
         )
         routing_m_multiple = 128
@@ -892,7 +922,7 @@ def _model_config(
         num_local_experts=num_local_experts,
         routing_world_size=ep_size,
         routing_m_multiple_of=routing_m_multiple,
-        mega=config.block_scaled is not None and config.block_scaled.pipeline == "mega",
+        mega=policy is not None and policy.pipeline == "mega",
     )
 
 
@@ -3951,8 +3981,10 @@ def routed_experts(  # noqa: C901
         w13_weight: Local BF16 gate/up weight with shape
             ``[E_local, 2, F, D]``, ``[E_local, 2F, D]``, or
             ``[E_local * 2F, D]``, or a prepared MXFP8/NVFP4 operand whose
-            source has one of those shapes. NVFP4 requires prepared weights
-            and an inference context.
+            source has one of those shapes. NVFP4 inference requires prepared
+            weights. Weight-only NVFP4 training takes BF16 weights, which it
+            fake-quantizes on every call, or weights prepared with
+            ``inference=False``; gradients pass straight through to them.
         w2_weight: Local BF16 down weight with shape ``[E_local, D, F]`` or
             ``[E_local * D, F]``, or a matching prepared MXFP8/NVFP4 operand.
         context: Factory-created execution context for these static shapes.
@@ -4005,7 +4037,7 @@ def routed_experts(  # noqa: C901
             raise ValueError(
                 "swiglu_clip_stats_out_3 must be on the Dist-MoE input device"
             )
-        if context.config.block_scaled is not None:
+        if _runs_block_scaled_kernels(context.config):
             raise ValueError("SwiGLU clip statistics are supported only by BF16")
     _validate_routing_shape(
         x_TD,
@@ -4021,6 +4053,27 @@ def routed_experts(  # noqa: C901
     ):
         raise TypeError(
             "w13_weight and w2_weight must either both be prepared or both be tensors"
+        )
+    policy = context.config.block_scaled
+    if policy is not None and policy.weight_only and not context.config.inference:
+        # Weight-only training runs the BF16 kernels on fake-quantized weights.
+        if options.weights_preprocess_fn is not None:
+            raise ValueError(
+                "weight_only training does not accept weights_preprocess_fn"
+            )
+        from ._blockscaled import _weight_only_training_weights
+
+        w13_weight, w2_weight, options = _weight_only_training_weights(
+            w13_weight, w2_weight, context, options
+        )
+        prepared = False
+    elif any(
+        isinstance(weight, PreparedWeight) and weight._fake_quantized
+        for weight in (w13_weight, w2_weight)
+    ):
+        raise ValueError(
+            "weights prepared for weight_only training need a weight_only "
+            "training context"
         )
     if prepared:
         if context.config.block_scaled is None:
@@ -4076,7 +4129,7 @@ def routed_experts(  # noqa: C901
             rmsnorm_weight_D,
         )
     )
-    if context.config.block_scaled is not None:
+    if _runs_block_scaled_kernels(context.config):
         # Importing registers the separate dispatcher schema without adding
         # low-precision compiler dependencies to BF16-only processes.
         from . import _blockscaled  # noqa: F401
@@ -4205,7 +4258,10 @@ def prepare_block_scaled_weight(
         inference: Whether to prepare FPROP-only inference operands. MXFP8
             training requires both FPROP and DGRAD scale orientations. By
             default, training quantizes 32x32 tiles and inference quantizes
-            1x32 row blocks.
+            1x32 row blocks. Weight-only NVFP4 training prepares the BF16
+            fake-quantized weight (:func:`quantize_dequantize_weight`), which
+            :func:`routed_experts` computes with while passing its gradients
+            straight through to ``weight``.
         fuse_swiglu: Prepare W13 for fused inference SwiGLU by interleaving
             quantized gate/up rows and their scales in groups of eight.
             Requires ``inference=True``, ``config.pipeline="mega"`` and W13
@@ -4220,10 +4276,11 @@ def prepare_block_scaled_weight(
             inference SwiGLU. Quantization happens before any gate/up row
             interleaving; execution performs no additional weight conversion.
             Explicit block sizes require MXFP8 and ``inference=True``.
-        out: Optional MXFP8 training storage to refill for the same logical
-            weight, shape, format, and device. Refill preserves the identical
-            storage tensors and returns a prepared wrapper associated with
-            ``weight``. It is unavailable for inference and NVFP4.
+        out: Optional MXFP8 or weight-only NVFP4 training storage to refill
+            for the same logical weight, shape, format, and device. Refill
+            preserves the identical storage tensors and returns a prepared
+            wrapper associated with ``weight``. It is unavailable for
+            inference.
 
     Returns:
         Prepared weight accepted by :func:`routed_experts`.
@@ -4242,3 +4299,45 @@ def prepare_block_scaled_weight(
         weight_block_size=weight_block_size,
         out=out,
     )
+
+
+def quantize_dequantize_weight(
+    weight: torch.Tensor,
+    config: BlockScaledConfig,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the weights a weight-only (W4A16) policy computes with.
+
+    Weight-only NVFP4 quantizes with Four Over Six (arXiv 2512.02010) in
+    Transformer Engine's NVFP4 arithmetic, as the W4A16 RL recipe of
+    radixark/miles does: each 1x16 block maps its largest magnitude to 4 or 6,
+    whichever has the lower squared error, with E4M3 block scales and one FP32
+    global scale per expert, ``2688 / amax``. The result dequantizes exactly
+    the codes and scales that :func:`prepare_block_scaled_weight` stores for
+    ``config``, as ``code * (block_scale * amax / 2688)`` rounded once to the
+    weight dtype; a weight-only training context computes with it, so training
+    sees the inference weights. The inference kernels apply the
+    inverse global scale to the FP32 accumulator instead; the two differ only
+    in how the global scale rounds.
+
+    Args:
+        weight: Contiguous CUDA BF16 or FP16 expert weight ``[E, N, K]`` with K
+            divisible by 16. Use ``[E, 2F, D]`` (gate rows, then up rows) for
+            W13 and ``[E, D, F]`` for W2. It is not differentiated.
+        config: Block-scaled policy with NVFP4 format and ``weight_only=True``.
+        out: Optional contiguous, 16-byte aligned tensor with the shape, dtype
+            and device of ``weight``, overwritten and returned.
+
+    Returns:
+        Fake-quantized weight with the shape and dtype of ``weight``.
+
+    Raises:
+        ValueError: If ``config`` is not weight-only NVFP4, or ``weight`` or
+            ``out`` violates the contract above.
+    """
+    if config.format != BlockScaledFormat.NVFP4 or not config.weight_only:
+        raise ValueError("quantize_dequantize_weight requires weight_only NVFP4")
+    from .kernels.nvfp4_four_over_six import four_over_six_qdq
+
+    return four_over_six_qdq(weight.detach(), out=out)

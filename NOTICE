@@ -30,3 +30,11 @@ Copyright (c) 2026 FlashInfer contributors.
 
 FlashInfer is licensed under the Apache License, Version 2.0. A copy of that
 license is provided in LICENSES/Apache-2.0.txt.
+
+This product includes portions of miles (https://github.com/radixark/miles),
+unchanged apart from formatting:
+
+  dist_moe/kernels/_miles_nvfp4_qdq.py
+
+miles is licensed under the Apache License, Version 2.0. A copy of that
+license is provided in LICENSES/Apache-2.0.txt.

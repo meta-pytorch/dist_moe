@@ -309,8 +309,8 @@ def _reference_swiglu_clip_stats(
 def _pin_nvfp4_global_scales(w_EXY: torch.Tensor) -> torch.Tensor:
     """Set each expert's amax so its NVFP4 inverse global scale is a power of two.
 
-    NVFP4 preparation sets the global scale to ``2688 * reciprocal(amax)``,
-    which is exactly ``2**m`` at ``amax = 2688 * 2**-m``. Then W4A16 Mega's
+    Weight-only preparation sets the global scale to ``2688 / amax``, which is
+    exactly ``2**m`` at ``amax = 2688 * 2**-m``. Then W4A16 Mega's
     FP32 scaling of the accumulator equals scaling the BF16 reference output
     (``bf16_swap_ab_fprop``). Experts cycle through three such amaxes, all
     above the random weights' magnitude, so their scales differ.
@@ -330,6 +330,13 @@ def _pin_nvfp4_global_scales(w_EXY: torch.Tensor) -> torch.Tensor:
     assert bool((flat.abs().amax(dim=1).float() < amax_E).all())
     flat[:, 0] = amax_E.to(w_EXY.dtype)
     return w_EXY
+
+
+_WEIGHT_ONLY_NVFP4 = dist_moe.BlockScaledConfig(
+    format=dist_moe.BlockScaledFormat.NVFP4,
+    pipeline="mega",
+    weight_only=True,
+)
 
 
 def _dequantize_prepared_nvfp4(weight: dist_moe.PreparedWeight) -> torch.Tensor:
@@ -1303,11 +1310,12 @@ class DistMoeConfigTest(unittest.TestCase):
             dist_moe.Config(hidden_dim=128, inference=True, **common)
 
     def test_weight_only_nvfp4_rejects_unsupported_modes(self) -> None:
-        """Admit W4A16 only as NVFP4 Mega plain-SwiGLU device-scratch inference.
+        """Reject W4A16 policies and inference configs the kernels lack.
 
         Each rejected combination would otherwise reach a kernel that does not
         implement it (staged or MXFP8 operands, tile overrides, other
-        activations, offset-backed VMM scratch, or training).
+        activations, offset-backed VMM scratch or other dimensions in the fused
+        inference kernel). Training runs the BF16 kernels, so it admits them.
         """
         kernel_config = dist_moe.BlockScaledKernelConfig(
             num_ctas=1,
@@ -1359,8 +1367,39 @@ class DistMoeConfigTest(unittest.TestCase):
                 vmm=dist_moe.VmmConfig(total_scratch_capacity_factor=2.0),
                 **common,
             )
-        with self.assertRaisesRegex(ValueError, "inference-only"):
-            dist_moe.Config(**{**common, "num_activation_slots": 1})
+        training = {**common, "num_activation_slots": 1}
+        dist_moe.Config(activation="swiglu_clamped", **training)
+        dist_moe.Config(**{**training, "hidden_dim": 64, "intermediate_dim": 64})
+        dist_moe.Config(
+            vmm=dist_moe.VmmConfig(total_scratch_capacity_factor=2.0), **training
+        )
+
+    def test_weight_only_nvfp4_training_plans_bf16_memory(self) -> None:
+        """Plan weight-only NVFP4 training exactly like BF16 training.
+
+        Training runs the BF16 kernels on fake-quantized weights, so its
+        activation slots and scratch must not take the block-scaled layouts.
+        """
+        common = {
+            "max_num_local_input_tokens": 512,
+            "hidden_dim": 2048,
+            "intermediate_dim": 768,
+            "top_k": 8,
+            "num_experts": 128,
+            "max_moe_layers_per_activation_slot": 4,
+            "num_activation_slots": 2,
+        }
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+            pipeline="mega",
+            weight_only=True,
+        )
+        self.assertEqual(
+            dist_moe.plan_memory(
+                dist_moe.Config(block_scaled=policy, **common), ep_size=4
+            ),
+            dist_moe.plan_memory(dist_moe.Config(**common), ep_size=4),
+        )
 
     def test_weight_only_nvfp4_plans_fused_kernel_storage(self) -> None:
         """Size static W4A16 scratch from the fused kernel's own carve-out.
@@ -3052,7 +3091,8 @@ class DistMoeKernelTest(unittest.TestCase):
                         context.reset()
 
     def test_training_cuda_graph_matches_eager_forward_and_backward(self) -> None:
-        """Match BF16 and MXFP8 graph outputs and gradients to eager execution."""
+        """Match BF16, MXFP8 and weight-only NVFP4 graph outputs and gradients to
+        eager execution."""
 
         def bind_run(
             context: dist_moe.Context,
@@ -3141,6 +3181,14 @@ class DistMoeKernelTest(unittest.TestCase):
                     format=dist_moe.BlockScaledFormat.MXFP8_E4M3,
                     pipeline="staged",
                 ),
+                True,
+                torch.float32,
+                "swiglu",
+            ),
+            ("nvfp4_weight_only", _WEIGHT_ONLY_NVFP4, False, None, "swiglu"),
+            (
+                "nvfp4_weight_only_accumulate_fp32",
+                _WEIGHT_ONLY_NVFP4,
                 True,
                 torch.float32,
                 "swiglu",
@@ -5095,6 +5143,177 @@ class DistMoeKernelTest(unittest.TestCase):
                 f"{name} cosine similarity",
             )
         context.close()
+
+    def test_w4a16_training_matches_bf16_on_fake_quantized_weights(self) -> None:
+        """Weight-only NVFP4 training equals BF16 training on its QDQ weights.
+
+        A weight-only training context runs the BF16 kernels on
+        ``quantize_dequantize_weight`` of its weights and passes the weight
+        gradients straight through. With raw weights (fake-quantized per call)
+        and with weights prepared with ``inference=False``, the output and the
+        input, score and weight gradients equal a BF16 context's on the
+        fake-quantized weights bit for bit. Over two microbatches, in-place
+        WGRAD reaches the source weights exactly as BF16's reaches its own, so
+        no gradient goes missing or is counted twice. ``out=`` refills the
+        prepared storage in place, and inference-prepared weights are rejected.
+        """
+        bf16_context, case_a, case_b, w13_EFD, w2_EDF = self._create_case(
+            inference=False
+        )
+        fake_w13 = dist_moe.quantize_dequantize_weight(w13_EFD, _WEIGHT_ONLY_NVFP4)
+        fake_w2 = dist_moe.quantize_dequantize_weight(w2_EDF, _WEIGHT_ONLY_NVFP4)
+        accumulate = dist_moe.ExecutionOptions(inplace_wgrad_accum=True)
+
+        def run(
+            context: dist_moe.Context,
+            cases: tuple[tuple[torch.Tensor, ...], ...],
+            w13: torch.Tensor | dist_moe.PreparedWeight,
+            w2: torch.Tensor | dist_moe.PreparedWeight,
+            options: dist_moe.ExecutionOptions | None = None,
+        ) -> list[torch.Tensor]:
+            """Run forward and backward per case; return outputs and grads."""
+            results = []
+            for x_TD, ids_TK, scores_TK in cases:
+                x = x_TD.clone().requires_grad_()
+                scores = scores_TK.clone().requires_grad_()
+                context.reset()
+                output_TD = dist_moe.routed_experts(
+                    x, ids_TK, scores, w13, w2, context, options=options
+                )
+                output_TD.float().square().mean().backward()
+                results += [output_TD.detach(), x.grad, scores.grad]
+            return results
+
+        def leaves(*weights: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            """Return fresh weight leaves that need gradients."""
+            return tuple(w.detach().clone().requires_grad_() for w in weights)
+
+        def assert_all_bitwise_equal(
+            actual: list[torch.Tensor | None], expected: list[torch.Tensor | None]
+        ) -> None:
+            """Assert equal bits for every paired tensor."""
+            for value, reference in zip(actual, expected, strict=True):
+                assert value is not None and reference is not None
+                torch.testing.assert_close(value, reference, rtol=0, atol=0)
+
+        bf16_w13, bf16_w2 = leaves(fake_w13, fake_w2)
+        expected = run(bf16_context, (case_a,), bf16_w13, bf16_w2)
+        expected += [bf16_w13.grad, bf16_w2.grad]
+        bf16_w13, bf16_w2 = leaves(fake_w13, fake_w2)
+        expected_accumulated = run(
+            bf16_context, (case_a, case_b), bf16_w13, bf16_w2, accumulate
+        )
+        expected_accumulated += [bf16_w13.grad, bf16_w2.grad]
+        bf16_context.close()
+
+        context = dist_moe.create_context(
+            group=dist.group.WORLD,
+            config=dataclasses.replace(
+                bf16_context.config, block_scaled=_WEIGHT_ONLY_NVFP4
+            ),
+        )
+        try:
+            w13, w2 = leaves(w13_EFD, w2_EDF)
+            actual = run(context, (case_a,), w13, w2)
+            assert_all_bitwise_equal([*actual, w13.grad, w2.grad], expected)
+
+            w13, w2 = leaves(w13_EFD, w2_EDF)
+            prepared_w13 = dist_moe.prepare_block_scaled_weight(w13, _WEIGHT_ONLY_NVFP4)
+            prepared_w2 = dist_moe.prepare_block_scaled_weight(w2, _WEIGHT_ONLY_NVFP4)
+            assert_all_bitwise_equal(
+                [prepared_w13.fprop_data, prepared_w2.fprop_data], [fake_w13, fake_w2]
+            )
+            actual = run(context, (case_a,), prepared_w13, prepared_w2)
+            assert_all_bitwise_equal([*actual, w13.grad, w2.grad], expected)
+
+            w13, w2 = leaves(w13_EFD, w2_EDF)
+            actual = run(context, (case_a, case_b), w13, w2, accumulate)
+            assert_all_bitwise_equal([*actual, w13.grad, w2.grad], expected_accumulated)
+
+            new_w13 = torch.randn_like(w13_EFD) * w13_EFD.shape[-1] ** -0.5
+            refilled = dist_moe.prepare_block_scaled_weight(
+                new_w13, _WEIGHT_ONLY_NVFP4, out=prepared_w13
+            )
+            self.assertIs(refilled.fprop_data, prepared_w13.fprop_data)
+            self.assertIs(refilled.source, new_w13)
+            assert_all_bitwise_equal(
+                [refilled.fprop_data],
+                [dist_moe.quantize_dequantize_weight(new_w13, _WEIGHT_ONLY_NVFP4)],
+            )
+
+            inference_w13 = dist_moe.prepare_block_scaled_weight(
+                w13_EFD, _WEIGHT_ONLY_NVFP4, inference=True
+            )
+            inference_w2 = dist_moe.prepare_block_scaled_weight(
+                w2_EDF, _WEIGHT_ONLY_NVFP4, inference=True
+            )
+            with self.assertRaisesRegex(ValueError, "inference=False"):
+                dist_moe.routed_experts(*case_a, inference_w13, inference_w2, context)
+        finally:
+            context.close()
+
+    def test_w4a16_training_matches_reference(self) -> None:
+        """Weight-only NVFP4 training matches the PyTorch reference MoE.
+
+        The reference runs ``_reference_moe`` on the fake-quantized weights,
+        whose gradients are the straight-through weight gradients. Forward and
+        all gradients meet the BF16 kernels' tolerances against the same
+        reference (``test_single_rank_forward_and_backward_match_reference``).
+        """
+        context, case_a, _case_b, w13_EFD, w2_EDF = self._create_case(
+            inference=False, block_scaled=_WEIGHT_ONLY_NVFP4
+        )
+        try:
+            x_TD, ids_TK, scores_TK = case_a
+            inputs = [
+                tensor.clone().requires_grad_()
+                for tensor in (x_TD, scores_TK, w13_EFD, w2_EDF)
+            ]
+            reference_inputs = [
+                inputs[0].detach().clone().requires_grad_(),
+                inputs[1].detach().clone().requires_grad_(),
+                *(
+                    dist_moe.quantize_dequantize_weight(w, _WEIGHT_ONLY_NVFP4)
+                    .clone()
+                    .requires_grad_()
+                    for w in (w13_EFD, w2_EDF)
+                ),
+            ]
+            actual = dist_moe.routed_experts(
+                inputs[0], ids_TK, inputs[1], inputs[2], inputs[3], context
+            )
+            reference = _reference_moe(
+                reference_inputs[0],
+                ids_TK,
+                reference_inputs[1],
+                reference_inputs[2],
+                reference_inputs[3],
+            )
+            torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+            self.assertLess(_relative_l2(actual, reference), 5e-3)
+            self.assertGreater(_cosine_similarity(actual, reference), 0.999)
+
+            grad = torch.randn_like(actual)
+            actual.backward(grad)
+            reference.backward(grad)
+            for name, tensor, reference_tensor in zip(
+                ("x", "topk_scores", "w13", "w2"), inputs, reference_inputs, strict=True
+            ):
+                actual_grad, expected_grad = tensor.grad, reference_tensor.grad
+                assert actual_grad is not None and expected_grad is not None
+                torch.testing.assert_close(
+                    actual_grad.float(),
+                    expected_grad.float(),
+                    rtol=3e-2,
+                    atol=3e-2,
+                    msg=lambda message, name=name: f"{name}: {message}",
+                )
+                self.assertLess(_relative_l2(actual_grad, expected_grad), 1e-2, name)
+                self.assertGreater(
+                    _cosine_similarity(actual_grad, expected_grad), 0.995, name
+                )
+        finally:
+            context.close()
 
     def test_bf16_clamped_swiglu_matches_reference(self) -> None:
         """Clamped BF16 forward and backward match the PyTorch formula."""

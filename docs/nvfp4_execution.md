@@ -23,7 +23,8 @@ NVFP4 uses only forward propagation (**FPROP**). It has no input-gradient
 <a id="public-contract"></a>
 ## Public contract
 
-NVFP4 is an inference-only mode. Expert ID `-1` marks an inactive route: it is
+NVFP4 is an inference-only mode, apart from
+[weight-only training](#train-weight-only-w4a16). Expert ID `-1` marks an inactive route: it is
 absent from communication and expert kernels, and final reduction masks the
 unwritten combine slot so an all-padding token produces an exact zero output
 row. The following fragment assumes the imports,
@@ -266,12 +267,21 @@ prepared_w13 = dist_moe.prepare_block_scaled_weight(
 prepared_w2 = dist_moe.prepare_block_scaled_weight(w2_EDF, policy, inference=True)
 ```
 
-Beyond the NVFP4 contract, the mode accepts only plain SwiGLU, device-only
+Beyond the NVFP4 contract, inference accepts only plain SwiGLU, device-only
 scratch (`vmm=None`) and automatic tiles (no `kernel_config`); configuration
 rejects the rest. W13 must be prepared with `fuse_swiglu=True`, and a call
-with concatenated W13 raises before any kernel launch. Prepared weights are
-the same NVFP4 operands as above, 0.5625 bytes per weight plus one FP32
-global scale and its reciprocal per expert.
+with concatenated W13 raises before any kernel launch. Prepared weights have
+the NVFP4 layout above, 0.5625 bytes per weight plus one FP32 global scale and
+its reciprocal per expert.
+
+Weight-only preparation quantizes with Four Over Six
+(`_prepare_nvfp4_weight_only_operands()`, see
+[Four Over Six quantization](nvfp4_kernel_design.md#four-over-six-quantization)):
+each 1x16 block maps its largest magnitude to 4 or to 6, whichever has the
+lower squared error, and the global scale is `2688 / amax` per expert.
+`dist_moe.quantize_dequantize_weight(weight, policy)` returns the BF16 weights
+these codes and scales dequantize to, which training computes with
+([below](#train-weight-only-w4a16)).
 
 The forward crosses the same registered operation:
 
@@ -295,6 +305,28 @@ For CUDA graphs, refresh weights by copying newly prepared `fprop_data`,
 `fprop_scale`, `global_scale` and `global_scale_inv` into the captured
 prepared tensors in place; replay reads them at the captured addresses.
 `benchmarks/w4a16_mega.py` times one layer per format through this API.
+
+<a id="train-weight-only-w4a16"></a>
+### Train for weight-only W4A16
+
+A training context (`inference=False`) with the same policy runs the BF16
+kernels on the fake-quantized weights and passes their gradients straight
+through to the BF16 weights, so the trainer computes with the weights the
+Mega kernel serves. Its memory plan and execution are the BF16 ones, so the
+inference-only restrictions above do not apply. As with MXFP8, the call takes
+BF16 weights, fake-quantized on every call, or weights prepared once per
+unshard and refilled in place:
+
+```python
+prepared_w13 = dist_moe.prepare_block_scaled_weight(w13_E2FD.flatten(1, 2), policy)
+prepared_w2 = dist_moe.prepare_block_scaled_weight(w2_EDF, policy)
+# After a later unshard, refill the same storage.
+dist_moe.prepare_block_scaled_weight(w13_E2FD.flatten(1, 2), policy, out=prepared_w13)
+```
+
+`fprop_data` then holds the BF16 fake-quantized weight. With
+`inplace_wgrad_accum`, WGRAD accumulates into the leaf parameters the source
+weights view, unless `wgrad_parameter_owners` names others.
 
 <a id="capture-and-replay-cuda-graphs"></a>
 ## Capture and replay CUDA graphs

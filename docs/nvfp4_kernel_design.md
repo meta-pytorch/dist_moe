@@ -16,6 +16,7 @@ scratch bounds; this guide explains the kernel views inside that allocation.
 - [Physical scales and scratch](#physical-scales-and-scratch)
 - [Publication and readiness](#publication-and-readiness)
 - [W4A16 Mega inference](#w4a16-mega-inference)
+- [Four Over Six quantization](#four-over-six-quantization)
 - [Compare with MXFP8](#compare-with-mxfp8)
 - [Preserve numerical and layout invariants](#preserve-numerical-and-layout-invariants)
 
@@ -368,6 +369,38 @@ order) for W13, `swiglu_fwd` and W2, for every token tile, with fresh and stale
 context storage. Its per-expert `alpha` values are powers of two, so scaling
 the BF16 reference output equals scaling the FP32 accumulator.
 `benchmarks/w4a16_mega.py` times the public weight-only path.
+
+<a id="four-over-six-quantization"></a>
+## Four Over Six quantization
+
+Weight-only preparation and `quantize_dequantize_weight()` share one
+quantizer (`kernels/nvfp4_four_over_six.py`): Four Over Six
+([arXiv 2512.02010](https://arxiv.org/abs/2512.02010)) in Transformer Engine's
+NVFP4 arithmetic, configured as the W4A16 RL recipe of radixark/miles does.
+The block arithmetic is miles' fused CuTe DSL QDQ kernel, vendored unchanged
+in `kernels/_miles_nvfp4_qdq.py` (Apache-2.0, recorded in NOTICE).
+
+```text
+encode[g] = 2688 / amax(w[g])            (FP32 division; 1 for an all-zero expert)
+block b:  s6 = E4M3(amax_b / 6 * encode)   s4 = E4M3(amax_b / 4 * encode)
+          codes_k = E2M1(w / (s_k / encode)) for k in (6, 4)
+          keep map-to-4 only if its squared error (code * s in FP16) is lower
+QDQ:      w_qdq = code * (s * amax / 2688)  (rounded once to the weight dtype)
+```
+
+Two launches cover a `[G, N, K]` expert stack in one grid of
+`[G, ctas_per_expert]` CTAs of 128 threads, one 1x16 block per thread and
+iteration, each expert with its own global scale. The QDQ launch stores the
+dequantized block; the quantize launch stores its eight code bytes (the even
+column in the low nibble) and its E4M3 scale byte in natural order. Weight-only
+preparation then interleaves W13 rows for fused SwiGLU and blocks the scales,
+so the prepared codes are exactly the ones the QDQ launch dequantizes. The
+inference kernels apply `1 / encode` to the FP32 accumulator, so trainer and
+generator differ only in how the global scale rounds.
+
+`tests/test_nvfp4_four_over_six.py` holds both launches bitwise equal to a
+PyTorch transcription of the arithmetic, and the prepared operands equal to
+the quantize launch.
 
 <a id="compare-with-mxfp8"></a>
 ## Compare with MXFP8

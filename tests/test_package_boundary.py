@@ -58,6 +58,7 @@ _EXPECTED_ROOT_EXPORTS = frozenset(
         "VmmConfig",
         "plan_memory",
         "prepare_block_scaled_weight",
+        "quantize_dequantize_weight",
         "routed_experts",
         "supports_fused_post_expert_rmsnorm",
     }

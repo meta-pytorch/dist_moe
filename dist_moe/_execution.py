@@ -258,8 +258,11 @@ class PreparedWeight:
         format: Block-scaled format used by every quantized operand.
         fprop_data: Format-specific contiguous CUDA FPROP qdata. MXFP8 stores
             E4M3 values; NVFP4 stores two packed E2M1 values per byte.
+            Weight-only NVFP4 training stores the BF16 fake-quantized weight,
+            shaped like ``source``.
         fprop_scale: Contiguous CUDA scale storage in the blocked layout
-            consumed directly by the FPROP kernel.
+            consumed directly by the FPROP kernel; absent for weight-only
+            NVFP4 training.
         dgrad_data: Contiguous transposed MXFP8 E4M3 DGRAD qdata. It is required
             for MXFP8 training and absent for inference-only NVFP4.
         dgrad_scale: Contiguous blocked DGRAD scales with the orientation
@@ -273,12 +276,13 @@ class PreparedWeight:
     source: torch.Tensor
     format: BlockScaledFormat
     fprop_data: torch.Tensor
-    fprop_scale: torch.Tensor
+    fprop_scale: torch.Tensor | None
     dgrad_data: torch.Tensor | None
     dgrad_scale: torch.Tensor | None
     global_scale: torch.Tensor | None = None
     global_scale_inv: torch.Tensor | None = None
     _interleaved_fc13: bool = False
+    _fake_quantized: bool = False
 
     def __init__(self) -> None:
         """Reject construction outside :func:`prepare_block_scaled_weight`.
@@ -295,12 +299,13 @@ class PreparedWeight:
         source: torch.Tensor,
         format: BlockScaledFormat,
         fprop_data: torch.Tensor,
-        fprop_scale: torch.Tensor,
+        fprop_scale: torch.Tensor | None,
         dgrad_data: torch.Tensor | None,
         dgrad_scale: torch.Tensor | None,
         global_scale: torch.Tensor | None = None,
         global_scale_inv: torch.Tensor | None = None,
         interleaved_fc13: bool = False,
+        fake_quantized: bool = False,
     ) -> PreparedWeight:
         """Construct one validated prepared-weight owner.
 
@@ -317,6 +322,8 @@ class PreparedWeight:
             global_scale_inv: Optional reciprocal global scale.
             interleaved_fc13: Whether FPROP rows contain adjacent gate/up
                 groups for the inference-only fused SwiGLU kernels.
+            fake_quantized: Whether ``fprop_data`` is the BF16 fake-quantized
+                weight of weight-only NVFP4 training.
 
         Returns:
             Factory-owned prepared-weight state.
@@ -332,6 +339,7 @@ class PreparedWeight:
             ("global_scale", global_scale),
             ("global_scale_inv", global_scale_inv),
             ("_interleaved_fc13", interleaved_fc13),
+            ("_fake_quantized", fake_quantized),
         ):
             object.__setattr__(prepared, name, value)
         return prepared
@@ -379,6 +387,7 @@ class PreparedWeight:
             global_scale=self.global_scale,
             global_scale_inv=self.global_scale_inv,
             interleaved_fc13=self._interleaved_fc13,
+            fake_quantized=self._fake_quantized,
         )
 
 
