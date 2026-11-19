@@ -1,0 +1,10 @@
+torch==2.15.0.dev20260926+cu130
+triton==3.8.0+gitc01b6774
+numpy==2.3.5
+packaging==26.3
+psutil==7.2.2
+apache-tvm-ffi==0.1.11
+nvidia-cutlass-dsl==4.7.1
+cuda-python==13.4.1
+cuda-bindings==13.4.3
+nvidia-ml-py==13.615.71

@@ -9,3 +9,6 @@ recursive-include docs *.md
 recursive-include examples *.py
 include tests/AGENTS.md
 recursive-include tests *.py
+
+recursive-include benchmarks *.py *.json *.md *.txt *.patch *.csv
+prune benchmarks/fb

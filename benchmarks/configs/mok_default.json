@@ -1,0 +1,11 @@
+{
+  "provenance": {
+    "repository": "https://github.com/cursor/mixture-of-kittens",
+    "revision": "f3a8bd2432457c5a2a2ea13915f0dcd0224581e4",
+    "source": "benchmarks/bench_mok.py:10-22",
+    "note": "Published dimensions. Isolated Dist-MoE has no shared expert; native MoK comparisons use one matched BF16 shared expert."
+  },
+  "shapes": [
+    {"name": "mok_default", "tokens": 2048, "hidden": 7168, "intermediate": 3072, "experts": 384, "top_k": 6}
+  ]
+}
