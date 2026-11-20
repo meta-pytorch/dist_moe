@@ -13,6 +13,9 @@ import private reference implementations or framework integrations.
   from documentation checks that import or execute the selected runtime.
 - `test_examples.py` runs each checked-in example as an exit-status smoke test;
   its VMM case belongs only on an isolated worker.
+- `test_w4a16_mega.py` holds the fused W4A16 Mega kernel bitwise equal to BF16
+  grouped GEMMs on the dequantized weights; `test_dist_moe.py` covers its
+  public weight-only path.
 
 The detailed feature contract belongs in the corresponding guide under
 `docs/`; tests should link to it rather than restating its implementation.

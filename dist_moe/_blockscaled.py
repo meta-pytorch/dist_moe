@@ -561,6 +561,8 @@ class _BlockscaledConfig:
     interleaved_fc13: bool = False
     routing_capacity: int | None = None
     static_inference_storage: bool = False
+    # NVFP4 weights with BF16 activations (W4A16 Mega inference).
+    weight_only: bool = False
 
     @property
     def policy(self) -> _FusedBlockscaledFormatPolicy:
@@ -597,9 +599,10 @@ class _ComputeDispatch:
             inference_mode: Whether the call omits backward state.
 
         Returns:
-            Whether dispatch uses packed row-quantized storage.
+            Whether dispatch uses packed row-quantized storage. W4A16 gathers
+            the native BF16 rows.
         """
-        return inference_mode
+        return inference_mode and not self.blockscaled.weight_only
 
 
 def _validate_compute_config(
@@ -1597,6 +1600,10 @@ class _BlockScaledAutograd(torch.autograd.Function):
         # receive capacity; no host decision depends on the routed row count.
         hidden_dim = x_TD.shape[1]
         routing_m_multiple = _routing_m_multiple(compute, inference_mode=inference_mode)
+        # The fused W4A16 kernel addresses every expert's rows at its exact
+        # prefix; routed-row padding would only add work. The planner keeps
+        # its scale-aligned multiple (an upper bound of the unpadded rows).
+        dispatch_m_multiple = 1 if blockscaled_cfg.weight_only else routing_m_multiple
         routing_world_size = dist.get_world_size(comm_group)
         local_expert_count = w13_compute_EFD.shape[0]
         scratch_imbalance_factor = (
@@ -1638,7 +1645,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 group=comm_group,
                 comm_buffer=comm_buffer,
                 expert_id_offset=None,
-                m_multiple_of=routing_m_multiple,
+                m_multiple_of=dispatch_m_multiple,
                 dispatch_stride_bytes=dispatch_stride_bytes,
                 bwd_dispatch_stride_bytes=x_TD.shape[1] * x_TD.element_size(),
                 generate_bwd_gather_ptrs=save_for_backward,
@@ -1721,7 +1728,38 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     # Descriptor/tile allocation is 128-aligned; routing's
                     # logical padded-row overflow bound remains unchanged.
                     capacity_rows = (capacity_rows + 127) // 128 * 128
-                if blockscaled_cfg.mega:
+                if blockscaled_cfg.weight_only:
+                    from .kernels.w4a16_mega import w4a16_mega_fprop
+
+                    w4a16_mega_fprop(
+                        w13=(
+                            w13_handle.blockscaled.w_q_fprop.view(torch.uint8),
+                            w13_handle.blockscaled.w_scale_fprop.view(torch.uint8),
+                            w13_handle.blockscaled.w_global_scale_inv,
+                        ),
+                        w2=(
+                            w2_handle.blockscaled.w_q_fprop.view(torch.uint8),
+                            w2_handle.blockscaled.w_scale_fprop.view(torch.uint8),
+                            w2_handle.blockscaled.w_global_scale_inv,
+                        ),
+                        split_sizes=num_tokens_per_local_expert_E.int(),
+                        gather_ptrs=dispatch_fwd_gather_ptrs,
+                        scatter_ptrs=combine_scatter_ptrs,
+                        num_rows=capacity_rows,
+                        expected_rows=min(num_tokens * topk, capacity_rows),
+                        hidden_dim=x_TD.shape[1],
+                        intermediate_dim=intermediate_dim,
+                        local_rank=local_rank,
+                        world_size=routing_world_size,
+                        num_sms=num_sms,
+                        operand_storage=(
+                            activation_buffer.buffer
+                            if static_inference_storage
+                            else None
+                        ),
+                    )
+                    h3_MD = combine_buffer.local()[:num_tokens]
+                elif blockscaled_cfg.mega:
                     mega_result = (
                         dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
                             w13=w13_handle.blockscaled.w_q_fprop,
@@ -3230,6 +3268,7 @@ def _blockscaled_compute_config(
         mega=policy.pipeline == "mega",
         static_inference_storage=context.config.inference
         and context.config.vmm is None,
+        weight_only=policy.weight_only,
     )
     config = (
         None
@@ -4468,6 +4507,10 @@ def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public executio
         raise ValueError("interleaved W13 requires an inference-only context")
     if interleaved_fc13 and policy.pipeline != "mega":
         raise ValueError("interleaved W13 requires the Mega inference pipeline")
+    if policy.weight_only and not interleaved_fc13:
+        raise ValueError(
+            "weight_only (W4A16) requires W13 prepared with fuse_swiglu=True"
+        )
     source_w13_EFD = prepared_w13.source if prepared_w13 is not None else w13_weight
     source_w2_EDF = prepared_w2.source if prepared_w2 is not None else w2_weight
     assert isinstance(source_w13_EFD, torch.Tensor)
