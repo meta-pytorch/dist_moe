@@ -49,6 +49,15 @@ def _inference_operand_bytes(
     }[_kernel_block_scaled_format(policy.format).value]
     groups = config.num_experts // ep_size
     storage_rows = (capacity_rows + 127) // 128 * 128
+    if policy.weight_only:
+        from .kernels.w4a16_mega import w4a16_mega_operand_bytes
+
+        return w4a16_mega_operand_bytes(
+            num_rows=storage_rows,
+            num_experts=groups,
+            hidden_dim=config.hidden_dim,
+            intermediate_dim=config.intermediate_dim,
+        )
     explicit = (
         None
         if policy.kernel_config is None

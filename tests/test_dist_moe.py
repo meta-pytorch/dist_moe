@@ -46,6 +46,7 @@ from dist_moe._execution import (
 from dist_moe._postprocess import (
     _registered_rmsnorm_args,
     _rmsnorm_from_registered_args,
+    _scale_and_sum,
     _validate_callback_output,
 )
 from dist_moe._triton_ops import (
@@ -64,8 +65,10 @@ from dist_moe.kernels import (
     grouped_gemm as grouped_gemm_impl,
     grouped_gemm_kernel as grouped_gemm_kernel_impl,
     mega_blockscaled_grouped_gemm as mega_impl,
+    w4a16_mega as w4a16_mega_impl,
 )
 from dist_moe.kernels.triton import swiglu as swiglu_impl
+from test_w4a16_mega import bf16_swap_ab_fprop, dequantize_nvfp4
 from torch._higher_order_ops.effects import has_effects
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.device_mesh import init_device_mesh
@@ -300,6 +303,135 @@ def _reference_swiglu_clip_stats(
         (gate_count, up_count, total),
         dtype=torch.float32,
         device=x_TD.device,
+    )
+
+
+def _pin_nvfp4_global_scales(w_EXY: torch.Tensor) -> torch.Tensor:
+    """Set each expert's amax so its NVFP4 inverse global scale is a power of two.
+
+    Weight-only preparation sets the global scale to ``2688 / amax``, which is
+    exactly ``2**m`` at ``amax = 2688 * 2**-m``. Then W4A16 Mega's
+    FP32 scaling of the accumulator equals scaling the BF16 reference output
+    (``bf16_swap_ab_fprop``). Experts cycle through three such amaxes, all
+    above the random weights' magnitude, so their scales differ.
+
+    Args:
+        w_EXY: BF16 expert weights; every element below ``0.65625``.
+
+    Returns:
+        A copy whose first element per expert is the pinned amax.
+    """
+    w_EXY = w_EXY.clone()
+    num_experts = w_EXY.shape[0]
+    amax_E = 2688 * torch.pow(
+        2.0, -12.0 + torch.arange(num_experts, device=w_EXY.device) % 3
+    )
+    flat = w_EXY.view(num_experts, -1)
+    assert bool((flat.abs().amax(dim=1).float() < amax_E).all())
+    flat[:, 0] = amax_E.to(w_EXY.dtype)
+    return w_EXY
+
+
+_WEIGHT_ONLY_NVFP4 = dist_moe.BlockScaledConfig(
+    format=dist_moe.BlockScaledFormat.NVFP4,
+    pipeline="mega",
+    weight_only=True,
+)
+
+
+def _dequantize_prepared_nvfp4(weight: dist_moe.PreparedWeight) -> torch.Tensor:
+    """Return the BF16 weights a canonical prepared NVFP4 weight encodes.
+
+    Exact when the inverse global scales are powers of two
+    (``_pin_nvfp4_global_scales``).
+
+    Args:
+        weight: Prepared NVFP4 weight without ``fuse_swiglu``.
+
+    Returns:
+        BF16 weights ``[E, N, K]``.
+    """
+    assert weight.fprop_scale is not None and weight.global_scale_inv is not None
+    w_ENK = dequantize_nvfp4(
+        weight.fprop_data.view(torch.uint8), weight.fprop_scale.view(torch.uint8)
+    )
+    return (w_ENK.float() * weight.global_scale_inv[:, None, None]).to(torch.bfloat16)
+
+
+def _w4a16_bf16_reference(
+    x_TD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
+    topk_scores_TK: torch.Tensor,
+    w13: dist_moe.PreparedWeight,
+    w2: dist_moe.PreparedWeight,
+    *,
+    block_n: int,
+) -> torch.Tensor:
+    """Evaluate routed W4A16 experts with BF16 kernels on dequantized weights.
+
+    Each route runs BF16 SWAP_AB FC13 on ``code * scale`` of the canonical
+    (gate rows, then up rows) prepared W13, scaled by its expert's inverse
+    global scale, then ``swiglu_fwd`` and FC2 the same way, in the fused
+    launch's token tile. The route rows are then reduced by the same
+    score-weighted reduction the public call uses, so the result is bitwise
+    comparable with weight-only NVFP4 Mega inference when the inverse global
+    scales are powers of two (``_pin_nvfp4_global_scales``).
+
+    Args:
+        x_TD: BF16 input tokens with shape ``[T, D]``.
+        topk_expert_ids_TK: Expert IDs with shape ``[T, K]``; ``-1`` routes
+            are inactive.
+        topk_scores_TK: Router scores with shape ``[T, K]``.
+        w13: Prepared NVFP4 W13 without ``fuse_swiglu``, covering every
+            expert the IDs address.
+        w2: Prepared NVFP4 W2 for the same experts.
+        block_n: Token tile of the fused launch under comparison.
+
+    Returns:
+        Reference output with shape ``[T, D]``.
+    """
+    num_tokens, top_k = topk_expert_ids_TK.shape
+    num_experts = w13.fprop_data.shape[0]
+    flat_ids = topk_expert_ids_TK.flatten()
+    routes = torch.nonzero(flat_ids >= 0).flatten()
+    order = routes[torch.argsort(flat_ids[routes], stable=True)]
+    split_sizes = torch.bincount(flat_ids[routes], minlength=num_experts).int()
+
+    def fprop(x_MK: torch.Tensor, weight: dist_moe.PreparedWeight) -> torch.Tensor:
+        """Run one prepared weight's BF16 reference GEMM."""
+        assert weight.global_scale_inv is not None
+        w_ENK = dequantize_nvfp4(
+            weight.fprop_data.view(torch.uint8), weight.fprop_scale.view(torch.uint8)
+        )
+        return bf16_swap_ab_fprop(
+            x_MK, w_ENK, split_sizes, weight.global_scale_inv, block_n=block_n
+        )
+
+    h1 = fprop(x_TD[order // top_k], w13)
+    routed_output = fprop(swiglu_impl.swiglu_fwd(h1), w2)
+    h3_MD = torch.zeros(
+        num_tokens * top_k, x_TD.shape[1], dtype=x_TD.dtype, device=x_TD.device
+    )
+    h3_MD[order] = routed_output
+    output_TD, _ = _scale_and_sum(
+        x_TKD=h3_MD.view(num_tokens, top_k, -1),
+        scale_TK=topk_scores_TK,
+        expert_ids_TK=topk_expert_ids_TK,
+        return_copy=False,
+        output_dtype=x_TD.dtype,
+    )
+    return output_TD
+
+
+def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Assert that two BF16 tensors have identical bits.
+
+    Args:
+        actual: Tensor produced by the implementation.
+        expected: Reference tensor.
+    """
+    torch.testing.assert_close(
+        actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
     )
 
 
@@ -1176,6 +1308,133 @@ class DistMoeConfigTest(unittest.TestCase):
             dist_moe.Config(hidden_dim=256, **common)
         with self.assertRaisesRegex(ValueError, "multiple of 256"):
             dist_moe.Config(hidden_dim=128, inference=True, **common)
+
+    def test_weight_only_nvfp4_rejects_unsupported_modes(self) -> None:
+        """Reject W4A16 policies and inference configs the kernels lack.
+
+        Each rejected combination would otherwise reach a kernel that does not
+        implement it (staged or MXFP8 operands, tile overrides, other
+        activations, offset-backed VMM scratch or other dimensions in the fused
+        inference kernel). Training runs the BF16 kernels, so it admits them.
+        """
+        kernel_config = dist_moe.BlockScaledKernelConfig(
+            num_ctas=1,
+            block_m=128,
+            block_n=32,
+            block_k=128,
+            num_smem_buffers=4,
+            num_c_stages=2,
+            num_tmem_buffers=2,
+            num_tile_buffers=3,
+            epilogue_subtile=1,
+            overlapping_accum=False,
+            swap_ab=True,
+            kloop_unroll=1,
+        )
+        for kwargs in (
+            {"format": dist_moe.BlockScaledFormat.MXFP8_E4M3, "pipeline": "mega"},
+            {"format": dist_moe.BlockScaledFormat.NVFP4, "pipeline": "staged"},
+            {
+                "format": dist_moe.BlockScaledFormat.NVFP4,
+                "pipeline": "mega",
+                "kernel_config": kernel_config,
+            },
+        ):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                with self.assertRaisesRegex(ValueError, "weight_only"):
+                    dist_moe.BlockScaledConfig(weight_only=True, **kwargs)
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+            pipeline="mega",
+            weight_only=True,
+        )
+        common = {
+            "max_num_local_input_tokens": 4,
+            "hidden_dim": 256,
+            "intermediate_dim": 256,
+            "top_k": 2,
+            "num_experts": 4,
+            "max_moe_layers_per_activation_slot": 1,
+            "num_activation_slots": 0,
+            "block_scaled": policy,
+        }
+        dist_moe.Config(inference=True, **common)
+        with self.assertRaisesRegex(ValueError, "plain SwiGLU"):
+            dist_moe.Config(inference=True, activation="swiglu_clamped", **common)
+        with self.assertRaisesRegex(ValueError, "device-only scratch"):
+            dist_moe.Config(
+                inference=True,
+                vmm=dist_moe.VmmConfig(total_scratch_capacity_factor=2.0),
+                **common,
+            )
+        training = {**common, "num_activation_slots": 1}
+        dist_moe.Config(activation="swiglu_clamped", **training)
+        dist_moe.Config(**{**training, "hidden_dim": 64, "intermediate_dim": 64})
+        dist_moe.Config(
+            vmm=dist_moe.VmmConfig(total_scratch_capacity_factor=2.0), **training
+        )
+
+    def test_weight_only_nvfp4_training_plans_bf16_memory(self) -> None:
+        """Plan weight-only NVFP4 training exactly like BF16 training.
+
+        Training runs the BF16 kernels on fake-quantized weights, so its
+        activation slots and scratch must not take the block-scaled layouts.
+        """
+        common = {
+            "max_num_local_input_tokens": 512,
+            "hidden_dim": 2048,
+            "intermediate_dim": 768,
+            "top_k": 8,
+            "num_experts": 128,
+            "max_moe_layers_per_activation_slot": 4,
+            "num_activation_slots": 2,
+        }
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+            pipeline="mega",
+            weight_only=True,
+        )
+        self.assertEqual(
+            dist_moe.plan_memory(
+                dist_moe.Config(block_scaled=policy, **common), ep_size=4
+            ),
+            dist_moe.plan_memory(dist_moe.Config(**common), ep_size=4),
+        )
+
+    def test_weight_only_nvfp4_plans_fused_kernel_storage(self) -> None:
+        """Size static W4A16 scratch from the fused kernel's own carve-out.
+
+        The memory plan must report exactly the bytes the W4A16 Mega launcher
+        carves from context scratch at the padded receive capacity, so the
+        launch never allocates and the plan is not oversized by the
+        block-scaled Mega layouts W4A16 does not use.
+        """
+        config = dist_moe.Config(
+            max_num_local_input_tokens=64,
+            hidden_dim=2048,
+            intermediate_dim=768,
+            top_k=8,
+            num_experts=128,
+            max_moe_layers_per_activation_slot=1,
+            num_activation_slots=0,
+            block_scaled=dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+                pipeline="mega",
+                weight_only=True,
+            ),
+            inference=True,
+            num_sms=148,
+        )
+        plan = dist_moe.plan_memory(config, ep_size=4)
+        storage_rows = (plan.total_scratch_capacity_rows + 127) // 128 * 128
+        expected = w4a16_mega_impl.w4a16_mega_operand_bytes(
+            num_rows=storage_rows,
+            num_experts=32,
+            hidden_dim=2048,
+            intermediate_dim=768,
+        )
+        self.assertEqual(plan.inference_operand_bytes, expected)
+        self.assertGreaterEqual(plan.device_scratch_bytes, expected)
 
     def test_prepared_weight_storage_membership_survives_release(self) -> None:
         """Storage discovery remains stable after external zero-size release."""
@@ -2832,7 +3091,8 @@ class DistMoeKernelTest(unittest.TestCase):
                         context.reset()
 
     def test_training_cuda_graph_matches_eager_forward_and_backward(self) -> None:
-        """Match BF16 and MXFP8 graph outputs and gradients to eager execution."""
+        """Match BF16, MXFP8 and weight-only NVFP4 graph outputs and gradients to
+        eager execution."""
 
         def bind_run(
             context: dist_moe.Context,
@@ -2921,6 +3181,14 @@ class DistMoeKernelTest(unittest.TestCase):
                     format=dist_moe.BlockScaledFormat.MXFP8_E4M3,
                     pipeline="staged",
                 ),
+                True,
+                torch.float32,
+                "swiglu",
+            ),
+            ("nvfp4_weight_only", _WEIGHT_ONLY_NVFP4, False, None, "swiglu"),
+            (
+                "nvfp4_weight_only_accumulate_fp32",
+                _WEIGHT_ONLY_NVFP4,
                 True,
                 torch.float32,
                 "swiglu",
@@ -4586,6 +4854,184 @@ class DistMoeKernelTest(unittest.TestCase):
                         activation=activation,
                     )
 
+    def test_w4a16_mega_inference_matches_bf16_and_replays(self) -> None:
+        """Run weight-only NVFP4 Mega inference through the public API.
+
+        One rank drives the fused dispatch/combine kernel through local
+        pointers. Eager output equals BF16 kernels on the dequantized weights
+        plus the same reduction bit for bit (``_w4a16_bf16_reference``), is
+        within BF16's tolerance of the PyTorch reference MoE on those weights,
+        and the launch carves its operands from the planned context scratch. Non-strict ``make_fx`` keeps the registered operation, and one
+        CUDA graph replays new inputs, an all-inactive token (an exact zero
+        row) and an in-place refill of the prepared weight storage, each
+        bitwise equal to eager. A W13 prepared without ``fuse_swiglu`` is
+        rejected before launch.
+        """
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+            pipeline="mega",
+            weight_only=True,
+        )
+        context, case_a, case_b, w13_EFD, w2_EDF = self._create_case(
+            block_scaled=policy
+        )
+        w13_EFD = _pin_nvfp4_global_scales(w13_EFD)
+        w2_EDF = _pin_nvfp4_global_scales(w2_EDF)
+        num_experts = w13_EFD.shape[0]
+        hidden_dim, intermediate_dim = w2_EDF.shape[1:]
+        padded_case = tuple(tensor.clone() for tensor in case_b)
+        padded_case[1][-1] = -1
+        padded_case[2][-1] = 0
+
+        def prepare(
+            w13: torch.Tensor, w2: torch.Tensor
+        ) -> tuple[dist_moe.PreparedWeight, ...]:
+            """Prepare fused W13, W2 and the canonical reference W13."""
+            return (
+                dist_moe.prepare_block_scaled_weight(
+                    w13, policy, inference=True, fuse_swiglu=True
+                ),
+                dist_moe.prepare_block_scaled_weight(w2, policy, inference=True),
+                dist_moe.prepare_block_scaled_weight(w13, policy, inference=True),
+            )
+
+        prepared_w13, prepared_w2, reference_w13 = prepare(w13_EFD, w2_EDF)
+
+        def run(
+            x_TD: torch.Tensor,
+            topk_expert_ids_TK: torch.Tensor,
+            topk_scores_TK: torch.Tensor,
+        ) -> torch.Tensor:
+            """Run the public call on the captured prepared weights."""
+            return dist_moe.routed_experts(
+                x_TD,
+                topk_expert_ids_TK,
+                topk_scores_TK,
+                prepared_w13,
+                prepared_w2,
+                context,
+            )
+
+        with torch.no_grad():
+            with mock.patch.object(
+                w4a16_mega_impl,
+                "w4a16_mega_fprop",
+                wraps=w4a16_mega_impl.w4a16_mega_fprop,
+            ) as fused:
+                eager_TD = run(*case_a)
+            self.assertEqual(fused.call_count, 1)
+            launch = fused.call_args.kwargs
+            # The launch carves its rows and counters from the context's
+            # planned scratch; the plan bounds this call's receive capacity.
+            activation_buffer = context.activation_buffer
+            assert activation_buffer is not None
+            self.assertEqual(
+                launch["operand_storage"].data_ptr(),
+                activation_buffer.buffer.data_ptr(),
+            )
+            self.assertGreaterEqual(
+                context.memory_plan.inference_operand_bytes,
+                w4a16_mega_impl.w4a16_mega_operand_bytes(
+                    num_rows=launch["num_rows"],
+                    num_experts=num_experts,
+                    hidden_dim=hidden_dim,
+                    intermediate_dim=intermediate_dim,
+                ),
+            )
+            block_n = w4a16_mega_impl.w4a16_mega_block_n(
+                launch["expected_rows"], num_experts
+            )
+
+            def reference(
+                inputs: tuple[torch.Tensor, ...],
+                w13: dist_moe.PreparedWeight,
+                w2: dist_moe.PreparedWeight,
+            ) -> torch.Tensor:
+                """Evaluate one input case with the BF16 reference kernels."""
+                return _w4a16_bf16_reference(*inputs, w13, w2, block_n=block_n)
+
+            _assert_bitwise_equal(
+                eager_TD, reference(case_a, reference_w13, prepared_w2)
+            )
+            dense_TD = _reference_moe(*case_a, w13_EFD, w2_EDF)
+            _rtol, _atol, relative_l2, cosine = _blockscaled_tolerance(
+                policy.format, "fwd"
+            )
+            self.assertLess(_relative_l2(eager_TD, dense_TD), relative_l2)
+            self.assertGreater(_cosine_similarity(eager_TD, dense_TD), cosine)
+            # The PyTorch reference MoE on the dequantized weights differs only
+            # in reduction order, so it meets the BF16 kernels' tolerance.
+            dequantized_TD = _reference_moe(
+                *case_a,
+                _dequantize_prepared_nvfp4(reference_w13),
+                _dequantize_prepared_nvfp4(prepared_w2),
+            )
+            torch.testing.assert_close(eager_TD, dequantized_TD, rtol=2e-2, atol=2e-2)
+            self.assertLess(_relative_l2(eager_TD, dequantized_TD), 5e-3)
+            self.assertGreater(_cosine_similarity(eager_TD, dequantized_TD), 0.999)
+
+            traced = make_fx(run)(*case_a)
+            self.assertIn(
+                torch.ops.dist_moe.block_scaled_forward.default,
+                {
+                    node.target
+                    for node in traced.graph.nodes
+                    if node.op == "call_function"
+                },
+            )
+            _assert_bitwise_equal(traced(*case_b), run(*case_b))
+
+            static_inputs = tuple(tensor.clone() for tensor in case_a)
+            run(*static_inputs)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured_TD = run(*static_inputs)
+            for inputs in (case_a, case_b, padded_case):
+                for static, value in zip(static_inputs, inputs, strict=True):
+                    static.copy_(value)
+                graph.replay()
+                torch.cuda.synchronize()
+                replayed_TD = captured_TD.clone()
+                _assert_bitwise_equal(replayed_TD, run(*inputs))
+                _assert_bitwise_equal(
+                    replayed_TD, reference(inputs, reference_w13, prepared_w2)
+                )
+            self.assertEqual(torch.count_nonzero(replayed_TD[-1]).item(), 0)
+            before_refill_TD = replayed_TD
+
+            # A weight reload refills the captured prepared storage in place;
+            # replay must read the new bytes at the captured addresses.
+            new_w13_EFD = _pin_nvfp4_global_scales(
+                torch.randn_like(w13_EFD) * hidden_dim**-0.5
+            )
+            new_w2_EDF = _pin_nvfp4_global_scales(
+                torch.randn_like(w2_EDF) * intermediate_dim**-0.5
+            )
+            new_w13, new_w2, new_reference_w13 = prepare(new_w13_EFD, new_w2_EDF)
+            for target, source in ((prepared_w13, new_w13), (prepared_w2, new_w2)):
+                for name in (
+                    "fprop_data",
+                    "fprop_scale",
+                    "global_scale",
+                    "global_scale_inv",
+                ):
+                    getattr(target, name).copy_(getattr(source, name))
+            graph.replay()
+            torch.cuda.synchronize()
+            refilled_TD = captured_TD.clone()
+            self.assertFalse(torch.equal(refilled_TD, before_refill_TD))
+            _assert_bitwise_equal(
+                refilled_TD,
+                dist_moe.routed_experts(*padded_case, new_w13, new_w2, context),
+            )
+            _assert_bitwise_equal(
+                refilled_TD, reference(padded_case, new_reference_w13, new_w2)
+            )
+
+            with self.assertRaisesRegex(ValueError, "fuse_swiglu"):
+                dist_moe.routed_experts(*case_a, reference_w13, prepared_w2, context)
+
     def test_single_rank_forward_and_backward_match_reference(self) -> None:
         """Fused operation matches a routed PyTorch reference and all gradients."""
         dist.init_process_group(
@@ -4697,6 +5143,177 @@ class DistMoeKernelTest(unittest.TestCase):
                 f"{name} cosine similarity",
             )
         context.close()
+
+    def test_w4a16_training_matches_bf16_on_fake_quantized_weights(self) -> None:
+        """Weight-only NVFP4 training equals BF16 training on its QDQ weights.
+
+        A weight-only training context runs the BF16 kernels on
+        ``quantize_dequantize_weight`` of its weights and passes the weight
+        gradients straight through. With raw weights (fake-quantized per call)
+        and with weights prepared with ``inference=False``, the output and the
+        input, score and weight gradients equal a BF16 context's on the
+        fake-quantized weights bit for bit. Over two microbatches, in-place
+        WGRAD reaches the source weights exactly as BF16's reaches its own, so
+        no gradient goes missing or is counted twice. ``out=`` refills the
+        prepared storage in place, and inference-prepared weights are rejected.
+        """
+        bf16_context, case_a, case_b, w13_EFD, w2_EDF = self._create_case(
+            inference=False
+        )
+        fake_w13 = dist_moe.quantize_dequantize_weight(w13_EFD, _WEIGHT_ONLY_NVFP4)
+        fake_w2 = dist_moe.quantize_dequantize_weight(w2_EDF, _WEIGHT_ONLY_NVFP4)
+        accumulate = dist_moe.ExecutionOptions(inplace_wgrad_accum=True)
+
+        def run(
+            context: dist_moe.Context,
+            cases: tuple[tuple[torch.Tensor, ...], ...],
+            w13: torch.Tensor | dist_moe.PreparedWeight,
+            w2: torch.Tensor | dist_moe.PreparedWeight,
+            options: dist_moe.ExecutionOptions | None = None,
+        ) -> list[torch.Tensor]:
+            """Run forward and backward per case; return outputs and grads."""
+            results = []
+            for x_TD, ids_TK, scores_TK in cases:
+                x = x_TD.clone().requires_grad_()
+                scores = scores_TK.clone().requires_grad_()
+                context.reset()
+                output_TD = dist_moe.routed_experts(
+                    x, ids_TK, scores, w13, w2, context, options=options
+                )
+                output_TD.float().square().mean().backward()
+                results += [output_TD.detach(), x.grad, scores.grad]
+            return results
+
+        def leaves(*weights: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            """Return fresh weight leaves that need gradients."""
+            return tuple(w.detach().clone().requires_grad_() for w in weights)
+
+        def assert_all_bitwise_equal(
+            actual: list[torch.Tensor | None], expected: list[torch.Tensor | None]
+        ) -> None:
+            """Assert equal bits for every paired tensor."""
+            for value, reference in zip(actual, expected, strict=True):
+                assert value is not None and reference is not None
+                torch.testing.assert_close(value, reference, rtol=0, atol=0)
+
+        bf16_w13, bf16_w2 = leaves(fake_w13, fake_w2)
+        expected = run(bf16_context, (case_a,), bf16_w13, bf16_w2)
+        expected += [bf16_w13.grad, bf16_w2.grad]
+        bf16_w13, bf16_w2 = leaves(fake_w13, fake_w2)
+        expected_accumulated = run(
+            bf16_context, (case_a, case_b), bf16_w13, bf16_w2, accumulate
+        )
+        expected_accumulated += [bf16_w13.grad, bf16_w2.grad]
+        bf16_context.close()
+
+        context = dist_moe.create_context(
+            group=dist.group.WORLD,
+            config=dataclasses.replace(
+                bf16_context.config, block_scaled=_WEIGHT_ONLY_NVFP4
+            ),
+        )
+        try:
+            w13, w2 = leaves(w13_EFD, w2_EDF)
+            actual = run(context, (case_a,), w13, w2)
+            assert_all_bitwise_equal([*actual, w13.grad, w2.grad], expected)
+
+            w13, w2 = leaves(w13_EFD, w2_EDF)
+            prepared_w13 = dist_moe.prepare_block_scaled_weight(w13, _WEIGHT_ONLY_NVFP4)
+            prepared_w2 = dist_moe.prepare_block_scaled_weight(w2, _WEIGHT_ONLY_NVFP4)
+            assert_all_bitwise_equal(
+                [prepared_w13.fprop_data, prepared_w2.fprop_data], [fake_w13, fake_w2]
+            )
+            actual = run(context, (case_a,), prepared_w13, prepared_w2)
+            assert_all_bitwise_equal([*actual, w13.grad, w2.grad], expected)
+
+            w13, w2 = leaves(w13_EFD, w2_EDF)
+            actual = run(context, (case_a, case_b), w13, w2, accumulate)
+            assert_all_bitwise_equal([*actual, w13.grad, w2.grad], expected_accumulated)
+
+            new_w13 = torch.randn_like(w13_EFD) * w13_EFD.shape[-1] ** -0.5
+            refilled = dist_moe.prepare_block_scaled_weight(
+                new_w13, _WEIGHT_ONLY_NVFP4, out=prepared_w13
+            )
+            self.assertIs(refilled.fprop_data, prepared_w13.fprop_data)
+            self.assertIs(refilled.source, new_w13)
+            assert_all_bitwise_equal(
+                [refilled.fprop_data],
+                [dist_moe.quantize_dequantize_weight(new_w13, _WEIGHT_ONLY_NVFP4)],
+            )
+
+            inference_w13 = dist_moe.prepare_block_scaled_weight(
+                w13_EFD, _WEIGHT_ONLY_NVFP4, inference=True
+            )
+            inference_w2 = dist_moe.prepare_block_scaled_weight(
+                w2_EDF, _WEIGHT_ONLY_NVFP4, inference=True
+            )
+            with self.assertRaisesRegex(ValueError, "inference=False"):
+                dist_moe.routed_experts(*case_a, inference_w13, inference_w2, context)
+        finally:
+            context.close()
+
+    def test_w4a16_training_matches_reference(self) -> None:
+        """Weight-only NVFP4 training matches the PyTorch reference MoE.
+
+        The reference runs ``_reference_moe`` on the fake-quantized weights,
+        whose gradients are the straight-through weight gradients. Forward and
+        all gradients meet the BF16 kernels' tolerances against the same
+        reference (``test_single_rank_forward_and_backward_match_reference``).
+        """
+        context, case_a, _case_b, w13_EFD, w2_EDF = self._create_case(
+            inference=False, block_scaled=_WEIGHT_ONLY_NVFP4
+        )
+        try:
+            x_TD, ids_TK, scores_TK = case_a
+            inputs = [
+                tensor.clone().requires_grad_()
+                for tensor in (x_TD, scores_TK, w13_EFD, w2_EDF)
+            ]
+            reference_inputs = [
+                inputs[0].detach().clone().requires_grad_(),
+                inputs[1].detach().clone().requires_grad_(),
+                *(
+                    dist_moe.quantize_dequantize_weight(w, _WEIGHT_ONLY_NVFP4)
+                    .clone()
+                    .requires_grad_()
+                    for w in (w13_EFD, w2_EDF)
+                ),
+            ]
+            actual = dist_moe.routed_experts(
+                inputs[0], ids_TK, inputs[1], inputs[2], inputs[3], context
+            )
+            reference = _reference_moe(
+                reference_inputs[0],
+                ids_TK,
+                reference_inputs[1],
+                reference_inputs[2],
+                reference_inputs[3],
+            )
+            torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+            self.assertLess(_relative_l2(actual, reference), 5e-3)
+            self.assertGreater(_cosine_similarity(actual, reference), 0.999)
+
+            grad = torch.randn_like(actual)
+            actual.backward(grad)
+            reference.backward(grad)
+            for name, tensor, reference_tensor in zip(
+                ("x", "topk_scores", "w13", "w2"), inputs, reference_inputs, strict=True
+            ):
+                actual_grad, expected_grad = tensor.grad, reference_tensor.grad
+                assert actual_grad is not None and expected_grad is not None
+                torch.testing.assert_close(
+                    actual_grad.float(),
+                    expected_grad.float(),
+                    rtol=3e-2,
+                    atol=3e-2,
+                    msg=lambda message, name=name: f"{name}: {message}",
+                )
+                self.assertLess(_relative_l2(actual_grad, expected_grad), 1e-2, name)
+                self.assertGreater(
+                    _cosine_similarity(actual_grad, expected_grad), 0.995, name
+                )
+        finally:
+            context.close()
 
     def test_bf16_clamped_swiglu_matches_reference(self) -> None:
         """Clamped BF16 forward and backward match the PyTorch formula."""
@@ -5871,3 +6488,157 @@ class DistMoeTwoRankTest(unittest.TestCase):
         self._run_two_rank_numerics(
             dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4)
         )
+
+    @with_comms
+    def test_w4a16_mega_inference_matches_bf16_over_peer_paths(self) -> None:
+        """Match two-rank weight-only NVFP4 Mega inference to the BF16 reference.
+
+        Every token routes to one expert on each rank, so the fused kernel
+        gathers BF16 rows from the peer's dispatch buffer and scatters route
+        rows into the peer's combine buffer. Each rank's eager output and a
+        CUDA-graph replay with new routing equal BF16 kernels on the
+        dequantized globally prepared weights plus the same reduction, bit for
+        bit (``_w4a16_bf16_reference``). Rank one's last token is fully inactive and returns an exact zero
+        row. The dense BF16 reference bounds the format error.
+        """
+        rank = dist.get_rank()
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        num_tokens, hidden_dim, intermediate_dim = 48, 1024, 512
+        num_experts, top_k = 4, 2
+        num_local_experts = num_experts // self.world_size
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+            pipeline="mega",
+            weight_only=True,
+        )
+
+        def routing(shift: int) -> tuple[torch.Tensor, ...]:
+            """Return one rank-local input case whose routes cross both ranks."""
+            global_token = rank * num_tokens + torch.arange(num_tokens, device=device)
+            first_expert = (global_token + shift) % num_experts
+            ids = torch.stack(
+                (first_expert, (first_expert + num_local_experts) % num_experts),
+                dim=1,
+            )
+            scores = torch.rand(num_tokens, top_k, device=device)
+            scores /= scores.sum(dim=1, keepdim=True)
+            if rank == 1:
+                ids[-1] = -1
+                scores[-1] = 0
+            x = 0.1 * torch.randn(
+                num_tokens, hidden_dim, device=device, dtype=torch.bfloat16
+            )
+            return x, ids, scores
+
+        torch.manual_seed(1000 + rank)
+        case_a, case_b = routing(0), routing(1)
+        # Identical global weights on both ranks; each rank prepares only its
+        # local shard for the fused call, and the reference uses all experts.
+        torch.manual_seed(2027)
+        full_w13 = _pin_nvfp4_global_scales(
+            torch.randn(
+                num_experts,
+                2 * intermediate_dim,
+                hidden_dim,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            * (hidden_dim**-0.5)
+        )
+        full_w2 = _pin_nvfp4_global_scales(
+            torch.randn(
+                num_experts,
+                hidden_dim,
+                intermediate_dim,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            * (intermediate_dim**-0.5)
+        )
+        local = slice(rank * num_local_experts, (rank + 1) * num_local_experts)
+        prepared_w13 = dist_moe.prepare_block_scaled_weight(
+            full_w13[local].contiguous(), policy, inference=True, fuse_swiglu=True
+        )
+        prepared_w2 = dist_moe.prepare_block_scaled_weight(
+            full_w2[local].contiguous(), policy, inference=True
+        )
+        reference_w13 = dist_moe.prepare_block_scaled_weight(
+            full_w13, policy, inference=True
+        )
+        reference_w2 = dist_moe.prepare_block_scaled_weight(
+            full_w2, policy, inference=True
+        )
+        context = dist_moe.create_context(
+            group=dist.group.WORLD,
+            config=dist_moe.Config(
+                max_num_local_input_tokens=num_tokens,
+                hidden_dim=hidden_dim,
+                intermediate_dim=intermediate_dim,
+                top_k=top_k,
+                num_experts=num_experts,
+                max_moe_layers_per_activation_slot=1,
+                num_activation_slots=0,
+                block_scaled=policy,
+                inference=True,
+            ),
+            device=device,
+        )
+        try:
+
+            def run(*inputs: torch.Tensor) -> torch.Tensor:
+                """Run the public call on this rank's prepared shard."""
+                return dist_moe.routed_experts(
+                    *inputs, prepared_w13, prepared_w2, context
+                )
+
+            with torch.no_grad():
+                with mock.patch.object(
+                    w4a16_mega_impl,
+                    "w4a16_mega_fprop",
+                    wraps=w4a16_mega_impl.w4a16_mega_fprop,
+                ) as fused:
+                    eager_TD = run(*case_a)
+                self.assertEqual(fused.call_count, 1)
+                launch = fused.call_args.kwargs
+                self.assertEqual(launch["world_size"], self.world_size)
+                self.assertEqual(launch["local_rank"], rank)
+                block_n = w4a16_mega_impl.w4a16_mega_block_n(
+                    launch["expected_rows"], num_local_experts
+                )
+                _assert_bitwise_equal(
+                    eager_TD,
+                    _w4a16_bf16_reference(
+                        *case_a, reference_w13, reference_w2, block_n=block_n
+                    ),
+                )
+                if rank == 1:
+                    self.assertEqual(torch.count_nonzero(eager_TD[-1]).item(), 0)
+                _rtol, _atol, relative_l2, cosine = _blockscaled_tolerance(
+                    policy.format, "fwd"
+                )
+                dense_TD = _reference_moe(*case_a, full_w13, full_w2)
+                self.assertLess(_relative_l2(eager_TD, dense_TD), relative_l2)
+                self.assertGreater(_cosine_similarity(eager_TD, dense_TD), cosine)
+
+                static_inputs = tuple(tensor.clone() for tensor in case_a)
+                run(*static_inputs)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured_TD = run(*static_inputs)
+                for static, value in zip(static_inputs, case_b, strict=True):
+                    static.copy_(value)
+                graph.replay()
+                torch.cuda.synchronize()
+                replayed_TD = captured_TD.clone()
+                _assert_bitwise_equal(replayed_TD, run(*case_b))
+                _assert_bitwise_equal(
+                    replayed_TD,
+                    _w4a16_bf16_reference(
+                        *case_b, reference_w13, reference_w2, block_n=block_n
+                    ),
+                )
+                self.assertFalse(torch.equal(replayed_TD, eager_TD))
+        finally:
+            context.close()

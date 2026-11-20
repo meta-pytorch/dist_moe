@@ -32,6 +32,7 @@ graph-stable PyTorch operations needed to execute routed experts.
 | BF16 | Standard | Yes | Yes |
 | MXFP8 E4M3 | Staged or Mega | Yes | Yes |
 | NVFP4 | Staged or Mega | No | Yes |
+| NVFP4 weights, BF16 activations (W4A16) | Mega | No | Yes |
 
 All supported modes work with non-strict `make_fx`, CUDA graphs, and optional
 VMM host-backed scratch. Training modes include forward and backward.
@@ -383,6 +384,14 @@ config = dist_moe.Config(
 ```
 
 See [NVFP4 inference](docs/nvfp4_execution.md).
+
+`weight_only=True` with `pipeline="mega"` keeps BF16 activations and decodes
+the prepared NVFP4 weights to BF16 inside one fused dispatch, W13, SwiGLU, W2
+and combine kernel (W4A16). Prepare W13 with `fuse_swiglu=True`; see
+[weight-only W4A16 Mega](docs/nvfp4_execution.md#weight-only-w4a16-mega). A
+training context with the same policy runs the BF16 kernels on the
+fake-quantized weights with straight-through gradients; see
+[weight-only training](docs/nvfp4_execution.md#train-weight-only-w4a16).
 
 <a id="plan-memory"></a>
 ## Plan memory
@@ -753,6 +762,7 @@ device capacity may use host backing. See [VMM host-backed scratch](docs/vmm.md)
 | [`dist_moe.MemoryPlan`](docs/memory_planner.md) / [`dist_moe.plan_memory`](docs/memory_planner.md) | Immutable memory plan and pure planning function |
 | [`dist_moe.Context`](docs/bf16_execution.md) / [`dist_moe.create_context`](docs/bf16_execution.md) | Reusable distributed runtime state and collective factory |
 | [`dist_moe.PreparedWeight`](docs/mxfp8_execution.md) / [`dist_moe.prepare_block_scaled_weight`](docs/mxfp8_execution.md) | Caller-owned block-scaled weight storage and preparation |
+| [`dist_moe.quantize_dequantize_weight`](docs/nvfp4_execution.md#weight-only-w4a16-mega) | Fake-quantized weights of weight-only NVFP4 for training |
 | [`dist_moe.routed_experts`](docs/bf16_execution.md) | BF16/MXFP8 training or BF16/MXFP8/NVFP4 inference |
 | [`dist_moe.supports_fused_post_expert_rmsnorm`](docs/postprocess.md) | Query fused RMSNorm shape/dtype support |
 

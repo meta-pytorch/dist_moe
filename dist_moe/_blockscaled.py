@@ -196,6 +196,50 @@ def _prepare_nvfp4_weight_operands(
     return qdata_ENQ, scale_RB, global_scale_E, torch.reciprocal(global_scale_E)
 
 
+@torch.library.custom_op("dist_moe::prepare_nvfp4_weight_only", mutates_args=())
+def _prepare_nvfp4_weight_only_operands(
+    weight_ENK: torch.Tensor,
+    fuse_swiglu: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize grouped weight-only NVFP4 weights with Four Over Six.
+
+    The codes and scales are the ones ``quantize_dequantize_weight``
+    dequantizes (``kernels/nvfp4_four_over_six.py``).
+
+    Args:
+        weight_ENK: Native grouped weight with expert, output, and input axes;
+            the input axis divisible by 16.
+        fuse_swiglu: Interleave W13 qdata and natural scale rows for fused
+            inference after quantization, preserving canonical scale groups.
+
+    Returns:
+        Packed qdata ``[E, N, K / 2]``, blocked scales, per-expert global
+        scales ``[E]``, and their reciprocals ``[E]``.
+    """
+    if weight_ENK.ndim != 3 or weight_ENK.shape[-1] % 16:
+        raise ValueError(
+            "weight-only NVFP4 preparation requires grouped weights with K "
+            "divisible by 16"
+        )
+    from .kernels.nvfp4_four_over_six import four_over_six_quantize
+    from .kernels.scale_factor_layout import natural_to_cublas_blocked
+
+    qdata_ENQ, scale_ENB, global_scale_E, global_scale_inv_E = four_over_six_quantize(
+        weight_ENK
+    )
+    scale_ENB = scale_ENB.view(torch.float8_e4m3fn)
+    if fuse_swiglu:
+        qdata_ENQ = _interleave_w13_rows(qdata_ENQ)
+        scale_ENB = _interleave_w13_rows(scale_ENB)
+    return (
+        qdata_ENQ.view(torch.float4_e2m1fn_x2),
+        natural_to_cublas_blocked(scale_ENB, is_a=False),
+        global_scale_E,
+        global_scale_inv_E,
+    )
+
+
+@_prepare_nvfp4_weight_only_operands.register_fake
 @_prepare_nvfp4_weight_operands.register_fake
 def _prepare_nvfp4_weight_fake(
     weight_ENK: torch.Tensor,
@@ -225,6 +269,113 @@ def _prepare_nvfp4_weight_fake(
         weight_ENK.new_empty((experts,), dtype=torch.float32),
         weight_ENK.new_empty((experts,), dtype=torch.float32),
     )
+
+
+@torch.library.custom_op("dist_moe::nvfp4_weight_only_qdq", mutates_args=())
+def _nvfp4_weight_only_qdq(weight_ENK: torch.Tensor) -> torch.Tensor:
+    """Fake-quantize grouped weights for weight-only NVFP4 training.
+
+    Args:
+        weight_ENK: Contiguous grouped BF16 weight with K divisible by 16.
+
+    Returns:
+        ``quantize_dequantize_weight`` of the weight, a new tensor.
+    """
+    from .kernels.nvfp4_four_over_six import four_over_six_qdq
+
+    return four_over_six_qdq(weight_ENK)
+
+
+@_nvfp4_weight_only_qdq.register_fake
+def _nvfp4_weight_only_qdq_fake(weight_ENK: torch.Tensor) -> torch.Tensor:
+    """Describe the fake-quantized weight without running the kernel.
+
+    Args:
+        weight_ENK: Grouped BF16 weight.
+
+    Returns:
+        An empty contiguous tensor like ``weight_ENK``.
+    """
+    return torch.empty_like(weight_ENK, memory_format=torch.contiguous_format)
+
+
+class _StraightThroughWeight(torch.autograd.Function):
+    """Compute with a fake-quantized weight; pass its gradient to the source.
+
+    The source is never read, so it may lack storage (an FSDP-managed weight).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any, source: torch.Tensor, fake_quantized: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the fake-quantized weight as the compute weight."""
+        del ctx, source
+        return fake_quantized.detach()
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Pass the compute weight's gradient to the source unchanged."""
+        del ctx
+        return grad, None
+
+
+def _weight_only_training_weights(
+    w13_weight: torch.Tensor | PreparedWeight,
+    w2_weight: torch.Tensor | PreparedWeight,
+    context: Context,
+    options: ExecutionOptions,
+) -> tuple[torch.Tensor, torch.Tensor, ExecutionOptions]:
+    """Return the compute weights and options of weight-only NVFP4 training.
+
+    Raw BF16 weights are fake-quantized on every call; weights prepared with
+    ``inference=False`` carry their fake-quantized copy. The BF16 kernels
+    compute with it and pass the gradients straight through to the sources.
+    In-place WGRAD accumulates into the sources' leaf parameters unless the
+    caller names owners.
+
+    Args:
+        w13_weight: Raw or prepared gate/up weight.
+        w2_weight: Raw or prepared down weight, of the same kind.
+        context: Weight-only NVFP4 training context.
+        options: Caller execution controls.
+
+    Returns:
+        Straight-through W13 and W2 compute weights, shaped like their sources,
+        and the options with resolved in-place WGRAD owners.
+
+    Raises:
+        ValueError: If prepared weights are not weight-only training weights.
+    """
+    from ._execution import _parameter_base, PreparedWeight
+
+    if isinstance(w13_weight, PreparedWeight) and isinstance(w2_weight, PreparedWeight):
+        if not (w13_weight._fake_quantized and w2_weight._fake_quantized):
+            raise ValueError(
+                "weight_only training requires weights prepared with inference=False"
+            )
+        w13_source, w2_source = w13_weight.source, w2_weight.source
+        w13_fake, w2_fake = w13_weight.fprop_data, w2_weight.fprop_data
+    else:
+        assert isinstance(w13_weight, torch.Tensor)
+        assert isinstance(w2_weight, torch.Tensor)
+        w13_source, w2_source = w13_weight, w2_weight
+        w13_ENK, w2_ENK = _reshape_weights(w13_weight, w2_weight, context)
+        w13_fake = _nvfp4_weight_only_qdq(w13_ENK.detach())
+        w2_fake = _nvfp4_weight_only_qdq(w2_ENK.detach())
+    w13_compute = _StraightThroughWeight.apply(
+        w13_source, w13_fake.view(w13_source.shape)
+    )
+    w2_compute = _StraightThroughWeight.apply(w2_source, w2_fake.view(w2_source.shape))
+    if options.inplace_wgrad_accum and options.wgrad_parameter_owners is None:
+        options = replace(
+            options,
+            wgrad_parameter_owners=(
+                _parameter_base(w13_source),
+                _parameter_base(w2_source),
+            ),
+        )
+    return w13_compute, w2_compute, options
 
 
 def _kernel_format(format: BlockScaledFormat) -> Any:
@@ -561,6 +712,8 @@ class _BlockscaledConfig:
     interleaved_fc13: bool = False
     routing_capacity: int | None = None
     static_inference_storage: bool = False
+    # NVFP4 weights with BF16 activations (W4A16 Mega inference).
+    weight_only: bool = False
 
     @property
     def policy(self) -> _FusedBlockscaledFormatPolicy:
@@ -597,9 +750,10 @@ class _ComputeDispatch:
             inference_mode: Whether the call omits backward state.
 
         Returns:
-            Whether dispatch uses packed row-quantized storage.
+            Whether dispatch uses packed row-quantized storage. W4A16 gathers
+            the native BF16 rows.
         """
-        return inference_mode
+        return inference_mode and not self.blockscaled.weight_only
 
 
 def _validate_compute_config(
@@ -1597,6 +1751,10 @@ class _BlockScaledAutograd(torch.autograd.Function):
         # receive capacity; no host decision depends on the routed row count.
         hidden_dim = x_TD.shape[1]
         routing_m_multiple = _routing_m_multiple(compute, inference_mode=inference_mode)
+        # The fused W4A16 kernel addresses every expert's rows at its exact
+        # prefix; routed-row padding would only add work. The planner keeps
+        # its scale-aligned multiple (an upper bound of the unpadded rows).
+        dispatch_m_multiple = 1 if blockscaled_cfg.weight_only else routing_m_multiple
         routing_world_size = dist.get_world_size(comm_group)
         local_expert_count = w13_compute_EFD.shape[0]
         scratch_imbalance_factor = (
@@ -1638,7 +1796,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 group=comm_group,
                 comm_buffer=comm_buffer,
                 expert_id_offset=None,
-                m_multiple_of=routing_m_multiple,
+                m_multiple_of=dispatch_m_multiple,
                 dispatch_stride_bytes=dispatch_stride_bytes,
                 bwd_dispatch_stride_bytes=x_TD.shape[1] * x_TD.element_size(),
                 generate_bwd_gather_ptrs=save_for_backward,
@@ -1721,7 +1879,38 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     # Descriptor/tile allocation is 128-aligned; routing's
                     # logical padded-row overflow bound remains unchanged.
                     capacity_rows = (capacity_rows + 127) // 128 * 128
-                if blockscaled_cfg.mega:
+                if blockscaled_cfg.weight_only:
+                    from .kernels.w4a16_mega import w4a16_mega_fprop
+
+                    w4a16_mega_fprop(
+                        w13=(
+                            w13_handle.blockscaled.w_q_fprop.view(torch.uint8),
+                            w13_handle.blockscaled.w_scale_fprop.view(torch.uint8),
+                            w13_handle.blockscaled.w_global_scale_inv,
+                        ),
+                        w2=(
+                            w2_handle.blockscaled.w_q_fprop.view(torch.uint8),
+                            w2_handle.blockscaled.w_scale_fprop.view(torch.uint8),
+                            w2_handle.blockscaled.w_global_scale_inv,
+                        ),
+                        split_sizes=num_tokens_per_local_expert_E.int(),
+                        gather_ptrs=dispatch_fwd_gather_ptrs,
+                        scatter_ptrs=combine_scatter_ptrs,
+                        num_rows=capacity_rows,
+                        expected_rows=min(num_tokens * topk, capacity_rows),
+                        hidden_dim=x_TD.shape[1],
+                        intermediate_dim=intermediate_dim,
+                        local_rank=local_rank,
+                        world_size=routing_world_size,
+                        num_sms=num_sms,
+                        operand_storage=(
+                            activation_buffer.buffer
+                            if static_inference_storage
+                            else None
+                        ),
+                    )
+                    h3_MD = combine_buffer.local()[:num_tokens]
+                elif blockscaled_cfg.mega:
                     mega_result = (
                         dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
                             w13=w13_handle.blockscaled.w_q_fprop,
@@ -3035,8 +3224,8 @@ def _prepare_blockscaled_weight(  # noqa: C901 -- preparation modes share one ow
             only. W2 and training retain their canonical row order.
         weight_block_size: Optional MXFP8 inference quantization grain. None
             preserves 1x32 inference and 32x32 training defaults.
-        out: Optional MXFP8 training storage to refill for the same shape and
-            format. Refill is unavailable for inference and NVFP4.
+        out: Optional MXFP8 or weight-only NVFP4 training storage to refill
+            for the same shape and format. Refill is unavailable for inference.
 
     Returns:
         Prepared weight accepted by :func:`_run_blockscaled`.
@@ -3063,6 +3252,27 @@ def _prepare_blockscaled_weight(  # noqa: C901 -- preparation modes share one ow
         raise ValueError("fuse_swiglu requires the Mega inference pipeline")
     if fuse_swiglu and weight.shape[1] % 16:
         raise ValueError("fused inference W13 requires F divisible by eight")
+    if config.weight_only and not inference:
+        # Weight-only training computes with the BF16 fake-quantized weight.
+        from .kernels.nvfp4_four_over_six import four_over_six_qdq
+
+        if out is not None:
+            if not out._fake_quantized or out.fprop_data.shape != weight.shape:
+                raise ValueError("out is not weight-only NVFP4 training storage")
+            with torch.no_grad():
+                four_over_six_qdq(weight, out=out.fprop_data)
+            return out._with_source(weight)
+        with torch.no_grad():
+            fake_quantized = four_over_six_qdq(weight)
+        return PreparedWeight._create(
+            source=weight,
+            format=config.format,
+            fprop_data=fake_quantized,
+            fprop_scale=None,
+            dgrad_data=None,
+            dgrad_scale=None,
+            fake_quantized=True,
+        )
     if out is not None:
         if inference or kernel_format != BlockScaledFormat.MXFP8_E4M3:
             raise ValueError("caller-owned refill supports MXFP8 training weights")
@@ -3081,13 +3291,18 @@ def _prepare_blockscaled_weight(  # noqa: C901 -- preparation modes share one ow
     if kernel_format == BlockScaledFormat.NVFP4:
         if weight.ndim != 3:
             raise ValueError("NVFP4 weight preparation requires grouped 3D weights")
+        prepare_nvfp4 = (
+            _prepare_nvfp4_weight_only_operands
+            if config.weight_only
+            else _prepare_nvfp4_weight_operands
+        )
         with torch.no_grad():
             (
                 qdata_ENQ,
                 scale_RB,
                 global_scale_E,
                 global_scale_inv_E,
-            ) = _prepare_nvfp4_weight_operands(weight, fuse_swiglu=fuse_swiglu)
+            ) = prepare_nvfp4(weight, fuse_swiglu=fuse_swiglu)
         return PreparedWeight._create(
             source=weight,
             format=config.format,
@@ -3230,6 +3445,7 @@ def _blockscaled_compute_config(
         mega=policy.pipeline == "mega",
         static_inference_storage=context.config.inference
         and context.config.vmm is None,
+        weight_only=policy.weight_only,
     )
     config = (
         None
@@ -4468,6 +4684,10 @@ def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public executio
         raise ValueError("interleaved W13 requires an inference-only context")
     if interleaved_fc13 and policy.pipeline != "mega":
         raise ValueError("interleaved W13 requires the Mega inference pipeline")
+    if policy.weight_only and not interleaved_fc13:
+        raise ValueError(
+            "weight_only (W4A16) requires W13 prepared with fuse_swiglu=True"
+        )
     source_w13_EFD = prepared_w13.source if prepared_w13 is not None else w13_weight
     source_w2_EDF = prepared_w2.source if prepared_w2 is not None else w2_weight
     assert isinstance(source_w13_EFD, torch.Tensor)
