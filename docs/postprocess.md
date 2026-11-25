@@ -19,14 +19,42 @@ output row per input token.
 <a id="choose-a-policy"></a>
 ## Choose a policy
 
-`dist_moe.ExecutionOptions.experts_output_postprocess` selects one of three
-behaviors:
+`dist_moe.ExecutionOptions.experts_output_postprocess` selects the combine policy:
 
 | Value | Forward behavior | Backward behavior | Graph support |
 | --- | --- | --- | --- |
 | `None` | Multiply route rows by router scores and reduce top-k. | Differentiate score weighting and reduction. | Registered op, FakeTensor, non-strict `make_fx`, activation checkpointing, CUDA graphs. |
 | Callable | Apply the callback to each route row, then perform ordinary score weighting and reduction. | Recompute the callback under autograd and differentiate it with the reduction. | Eager only. |
 | `dist_moe.RMSNormPostprocess` | Fuse RMSNorm, router-score weighting, and top-k reduction. | Use the fused RMSNorm/reduction backward. | Callback-free policies use the registered graph boundary; observers select eager execution. |
+| `dist_moe.InputScaledRMSNormPostprocess` | Fuse `rmsnorm(x * (weight + gain_center))` with score weighting and top-k reduction, saving the W2 output in the same launch. | Recompute RMS statistics from the saved or replayed W2 output, publish route gradients in place, and accumulate the gain gradient through the caller's weight getter. | Eager only. |
+
+`InputScaledRMSNormPostprocess` is for a learned post-expert gain that trains;
+`RMSNormPostprocess.weight` is inference-only. Its `weight_getter` returns the
+gain, a contiguous `[D]` tensor with the input dtype on the input device; it is
+validated when the policy is resolved and called again in forward and backward,
+so a framework may reshard the parameter in between. A gain that does not
+require grad is frozen: backward skips its gradient.
+
+BF16 and block-scaled execution both publish BF16 route outputs, so both use the
+fused kernels when the scores are FP32, top-k is a power of two, and the hidden
+dimension `D` is a power of two with `D <= 4096` and `top-k * D <= 32768`. The
+bound keeps each kernel's FP32 route tile at 32 values per thread; larger tiles
+would spill registers. Other shapes run the policy as an ordinary eager callback
+that computes the same norm in FP32, so keep
+`ExecutionOptions.zero_out_padded_callback_inputs=True` when routes can be
+padded.
+
+Backward runs two persistent programs per SM over blocks of four routes. Each
+program keeps its gain-gradient partial in registers and writes one FP32 row,
+so the extra workspace is `2 * num_SMs * D * 4` bytes, and the reduction order
+is fixed for a device type and token count.
+
+Both paths compute in FP32 from the gain plus `gain_center`. Relative to an FP32
+reference they intentionally round the normalized routes to BF16 before score
+weighting (score gradients use the rounded routes), round each normalized-route
+gradient `grad_output * score` to BF16, and round outputs and gradients to their
+storage dtypes. The fused kernels also reduce in a different order than the
+callback, so compare the two with BF16 tolerances.
 
 Routing scores and top-k expert IDs are inputs to Dist-MoE. Routing itself is
 not part of postprocessing and is not computed by these kernels.

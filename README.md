@@ -750,6 +750,7 @@ device capacity may use host backing. See [VMM host-backed scratch](docs/vmm.md)
 | [`dist_moe.BlockScaledKernelConfig`](docs/mxfp8_execution.md) | Expert-only complete CuTe launch override |
 | [`dist_moe.ExecutionOptions`](docs/wgrad_accumulation.md) | Per-call accumulation, postprocess, observer, and callback controls |
 | [`dist_moe.RMSNormPostprocess`](docs/postprocess.md) | Typed fused post-expert RMSNorm policy |
+| [`dist_moe.InputScaledRMSNormPostprocess`](docs/postprocess.md) | Fused input-scale RMSNorm with a trainable gain |
 | [`dist_moe.MemoryPlan`](docs/memory_planner.md) / [`dist_moe.plan_memory`](docs/memory_planner.md) | Immutable memory plan and pure planning function |
 | [`dist_moe.Context`](docs/bf16_execution.md) / [`dist_moe.create_context`](docs/bf16_execution.md) | Reusable distributed runtime state and collective factory |
 | [`dist_moe.PreparedWeight`](docs/mxfp8_execution.md) / [`dist_moe.prepare_block_scaled_weight`](docs/mxfp8_execution.md) | Caller-owned block-scaled weight storage and preparation |

@@ -58,6 +58,7 @@ from ._postprocess import (
     _registered_rmsnorm_args,
     _resolve_experts_output_postprocess_fn,
     _rmsnorm_from_registered_args,
+    InputScaledRMSNormPostprocess,
     RMSNormPostprocess,
     supports_fused_post_expert_rmsnorm,
 )
@@ -88,6 +89,7 @@ __all__ = [
     "Config",
     "Context",
     "ExecutionOptions",
+    "InputScaledRMSNormPostprocess",
     "MemoryPlan",
     "PreparedWeight",
     "VmmConfig",

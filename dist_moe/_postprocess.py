@@ -27,9 +27,9 @@ class RMSNormPostprocess:
     norms — is supported for INFERENCE ONLY by setting ``weight`` (and, for
     zero-centered gamma, ``gain_center=1.0``): the gamma is applied inside the
     single fused kernel, with no extra pre-scaling launch. Training with a
-    weighted norm must use a callback, or fold the effective gamma (including
-    any gain center) into the corresponding output rows of ``w2`` for
-    inference from pre-quantized weights.
+    learned input-scale gain uses :class:`InputScaledRMSNormPostprocess`;
+    inference from pre-quantized weights may instead fold the effective gamma
+    (including any gain center) into the corresponding output rows of ``w2``.
 
     Supported hidden dimensions are multiples of 128 from 256 through 131072.
     Bitwise backward follows the standalone projection and score-gradient
@@ -88,7 +88,81 @@ class RMSNormPostprocess:
     recompute_rstd: bool = False
 
 
-_ExpertsOutputPostprocess = _ExpertsOutputPostprocessFn | RMSNormPostprocess | None
+@dataclass(frozen=True)
+class InputScaledRMSNormPostprocess:
+    """Route-wise ``rmsnorm(x * (weight + gain_center))`` with a trainable gain.
+
+    Use this instead of ``RMSNormPostprocess.weight``, which is inference-only,
+    when the gain trains. With BF16 route outputs (BF16 and block-scaled
+    execution), FP32 scores, a power-of-two top-k, and a power-of-two hidden
+    dimension ``D`` with ``D <= 4096`` and ``topk * D <= 32768``, one fused
+    forward kernel normalizes, score-weights, and reduces the routes; backward
+    recomputes the RMS statistics, publishes route gradients in place, and
+    returns score and gain gradients. Other shapes call this policy as an
+    ordinary eager callback.
+
+    Both paths compute in FP32 from the input-dtype gain plus ``gain_center``.
+    Relative to an FP32 reference, they intentionally round the normalized
+    routes to the input dtype before score weighting (score gradients use the
+    rounded routes), round each normalized-route gradient
+    ``grad_output * score`` to the input dtype, and round outputs and
+    gradients to their storage dtypes. The fused kernels also reduce in a
+    different order than the callback, so the paths agree within BF16
+    tolerance, not bitwise.
+
+    The gain gradient reaches the parameter through the tensor ``weight_getter``
+    returns under grad mode in backward, as for a callback's closure parameters;
+    a gain that does not require grad is treated as frozen.
+
+    Args:
+        weight_getter: Returns the live contiguous gain of shape ``[D]`` with
+            the Dist-MoE input dtype on the input device. It is called at
+            resolution, in forward, and again in backward, so a framework may
+            materialize or reshard the parameter in between.
+        eps: Positive epsilon added to the mean square.
+        gain_center: Constant added to the gain before input scaling.
+    """
+
+    weight_getter: Callable[[], torch.Tensor]
+    eps: float
+    gain_center: float
+
+    def __post_init__(self) -> None:
+        """Validate the static parameters.
+
+        Raises:
+            TypeError: If the weight getter is not callable.
+            ValueError: If ``eps`` or ``gain_center`` is invalid.
+        """
+        if not callable(self.weight_getter):
+            raise TypeError("InputScaledRMSNormPostprocess requires a weight getter")
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError(
+                "InputScaledRMSNormPostprocess eps must be positive and finite"
+            )
+        if not math.isfinite(self.gain_center):
+            raise ValueError("InputScaledRMSNormPostprocess gain_center must be finite")
+
+    def __call__(self, input_MD: torch.Tensor) -> torch.Tensor:
+        """Apply the norm eagerly where the fused kernels do not apply.
+
+        Args:
+            input_MD: Route-wise expert output with shape ``[M, D]``.
+
+        Returns:
+            Normalized routes computed in FP32 and returned in the input dtype.
+        """
+        scaled_MD = input_MD.float() * (self.weight_getter().float() + self.gain_center)
+        rstd_M1 = torch.rsqrt(scaled_MD.square().mean(-1, keepdim=True) + self.eps)
+        return (scaled_MD * rstd_M1).to(input_MD.dtype)
+
+
+_ExpertsOutputPostprocess = (
+    _ExpertsOutputPostprocessFn
+    | RMSNormPostprocess
+    | InputScaledRMSNormPostprocess
+    | None
+)
 
 
 def _postprocess_requires_eager(postprocess: _ExpertsOutputPostprocess) -> bool:
@@ -260,10 +334,10 @@ class _ResolvedExpertsPostprocess:
 
     ``_resolve_experts_output_postprocess_fn`` maps every accepted public shape
     of ``experts_output_postprocess`` (None, plain callback,
-    `RMSNormPostprocess`) onto one of three variants of this structure, each a
-    straight-line implementation. Backends make exactly two calls —
-    ``forward`` and ``backward`` — and never branch on whether the norm is
-    fused with the reduction.
+    `RMSNormPostprocess`, `InputScaledRMSNormPostprocess`) onto one of four
+    variants of this structure, each a straight-line implementation. Backends
+    make exactly two calls — ``forward`` and ``backward`` — and never branch
+    on whether the norm is fused with the reduction.
 
     ``forward(h3, scores, *, output_dtype, save, save_requires_copy,
     save_buffer, save_offset, save_condition)`` returns
@@ -280,8 +354,8 @@ class _ResolvedExpertsPostprocess:
     ``(shape, dtype) -> Tensor`` factory for the buffer the caller wants
     ``grad_h3`` published into; variants that cannot write their gradient
     directly ignore it and return ``published=False``. ``x_buffer*`` let the
-    postprocess-free variant read the reduction input straight from the
-    activation buffer.
+    postprocess-free and fused input-scaled RMSNorm variants read the
+    reduction input straight from the activation buffer.
     """
 
     forward: Callable[
@@ -291,8 +365,9 @@ class _ResolvedExpertsPostprocess:
     backward: Callable[..., tuple[torch.Tensor, torch.Tensor, bool]]
     includes_scale_and_sum: bool
     # True when forward fuses the saved-h3 copy into the reduction launch and
-    # backward reads the reduction input straight from an aliased buffer (the
-    # postprocess-free variant). Callers use it to decide buffer staging.
+    # backward reads the reduction input straight from the activation buffer
+    # (the postprocess-free and fused input-scaled RMSNorm variants), so
+    # callers do not stage it back into the combine buffer.
     fuses_saved_copy_into_reduction: bool = False
 
 
@@ -302,8 +377,9 @@ def _validate_experts_output_postprocess_type(
     """Validate the accepted public post-expert processing forms.
 
     Args:
-        experts_output_postprocess: ``None``, a direct route-wise callback,
-            or an ``RMSNormPostprocess`` configuration.
+        experts_output_postprocess: ``None``, a direct route-wise callback
+            (including ``InputScaledRMSNormPostprocess``), or an
+            ``RMSNormPostprocess`` configuration.
 
     Raises:
         ValueError: If the value is not one of the supported forms.
@@ -767,8 +843,8 @@ def _validate_rmsnorm_weight(
     if not inference_mode:
         raise ValueError(
             "RMSNormPostprocess weight (input-scale gamma) is "
-            "inference/forward-only; training with a weighted post-expert "
-            "norm must use a callback postprocess"
+            "inference/forward-only; training with a learned input-scale "
+            "gain must use InputScaledRMSNormPostprocess"
         )
 
 
@@ -784,8 +860,9 @@ def _resolve_experts_output_postprocess_fn(
     """Resolve the public postprocess value to straight-line execution hooks.
 
     Args:
-        experts_output_postprocess: Public callback, RMSNorm config, ``None``,
-            or an already resolved private runtime value.
+        experts_output_postprocess: Public callback, RMSNorm config,
+            input-scaled RMSNorm policy, ``None``, or an already resolved
+            private runtime value.
         x_TD: Dist-MoE input, which defines output dtype and hidden width.
         topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
         topk_scores_TK: Router scores with shape ``[T, K]``.
@@ -803,6 +880,18 @@ def _resolve_experts_output_postprocess_fn(
     num_tokens, topk = topk_scores_TK.shape
     if experts_output_postprocess is None:
         return _resolve_reduction_only(num_tokens, topk, topk_expert_ids_TK)
+    if isinstance(experts_output_postprocess, InputScaledRMSNormPostprocess):
+        # Import lazily: the fused hooks build on this module's resolved type.
+        from ._input_scaled_rmsnorm import _resolve_input_scaled_rmsnorm
+
+        resolved = _resolve_input_scaled_rmsnorm(
+            experts_output_postprocess,
+            x_TD=x_TD,
+            topk_expert_ids_TK=topk_expert_ids_TK,
+            topk_scores_TK=topk_scores_TK,
+        )
+        if resolved is not None:
+            return resolved
     if callable(experts_output_postprocess):
         return _resolve_callback(
             experts_output_postprocess,

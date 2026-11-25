@@ -52,6 +52,7 @@ _EXPECTED_ROOT_EXPORTS = frozenset(
         "Context",
         "create_context",
         "ExecutionOptions",
+        "InputScaledRMSNormPostprocess",
         "MemoryPlan",
         "PreparedWeight",
         "RMSNormPostprocess",

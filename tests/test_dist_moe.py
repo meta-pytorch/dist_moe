@@ -45,6 +45,7 @@ from dist_moe._execution import (
 )
 from dist_moe._postprocess import (
     _registered_rmsnorm_args,
+    _resolve_experts_output_postprocess_fn,
     _rmsnorm_from_registered_args,
     _validate_callback_output,
 )
@@ -3428,6 +3429,112 @@ class DistMoeKernelTest(unittest.TestCase):
                             _cosine_similarity(actual, expected), cosine, msg=name
                         )
                 self._assert_planner_reset(context.activation_buffer)
+
+    def test_input_scaled_rmsnorm_fuses_in_bf16_and_mxfp8_training(self) -> None:
+        """Fuse the trainable input-scale RMSNorm on BF16 and MXFP8 routes.
+
+        Each precision runs the policy, which must resolve to the fused
+        kernels, and then an independent FP32 eager norm as a plain callback
+        on the same context and inputs, with one padded token. Output and
+        every gradient, including the gain's, must agree: elementwise for
+        BF16, within the calibrated relative-L2 and cosine bounds for MXFP8,
+        whose backward requantizes the slightly different route gradients.
+        """
+        eps, gain_center = 1e-6, 1.0
+        for block_scaled in (None, dist_moe.BlockScaledConfig()):
+            with self.subTest(block_scaled=block_scaled is not None):
+                context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                    num_tokens=32,
+                    hidden_dim=1024,
+                    inference=False,
+                    block_scaled=block_scaled,
+                )
+                x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+                topk_expert_ids_TK = topk_expert_ids_TK.clone()
+                topk_expert_ids_TK[0] = -1
+                topk_scores_TK = topk_scores_TK.clone()
+                topk_scores_TK[0] = 0
+                gain_D = 0.1 * torch.randn(
+                    x_TD.shape[-1], dtype=torch.bfloat16, device=x_TD.device
+                )
+
+                def run(fused: bool):
+                    inputs = [
+                        tensor.detach().clone().requires_grad_()
+                        for tensor in (x_TD, topk_scores_TK, w13_EFD, w2_EDF, gain_D)
+                    ]
+                    gain = inputs[-1]
+
+                    def eager_norm(h3_MD: torch.Tensor) -> torch.Tensor:
+                        scaled_MD = h3_MD.float() * (gain.float() + gain_center)
+                        rstd_M1 = torch.rsqrt(
+                            scaled_MD.square().mean(-1, keepdim=True) + eps
+                        )
+                        return (scaled_MD * rstd_M1).to(h3_MD.dtype)
+
+                    postprocess = eager_norm
+                    if fused:
+                        postprocess = dist_moe.InputScaledRMSNormPostprocess(
+                            weight_getter=lambda: gain, eps=eps, gain_center=gain_center
+                        )
+                        self.assertTrue(
+                            _resolve_experts_output_postprocess_fn(
+                                postprocess,
+                                x_TD=x_TD,
+                                topk_expert_ids_TK=topk_expert_ids_TK,
+                                topk_scores_TK=topk_scores_TK,
+                            ).includes_scale_and_sum
+                        )
+                    output_TD = dist_moe.routed_experts(
+                        inputs[0],
+                        topk_expert_ids_TK,
+                        *inputs[1:4],
+                        context,
+                        options=dist_moe.ExecutionOptions(
+                            experts_output_postprocess=postprocess,
+                            zero_out_padded_callback_inputs=True,
+                        ),
+                    )
+                    output_TD.backward(grad_output_TD)
+                    self._assert_planner_reset(context.activation_buffer)
+                    return [output_TD.detach(), *(tensor.grad for tensor in inputs)]
+
+                torch.manual_seed(0)
+                grad_output_TD = torch.randn_like(x_TD)
+                actual = run(fused=True)
+                expected = run(fused=False)
+                names = ("output", "x", "topk_scores", "w13", "w2", "gain")
+                for name, actual_value, expected_value in zip(
+                    names, actual, expected, strict=True
+                ):
+                    if block_scaled is None:
+                        tolerance = 2e-2 if name == "output" else 3e-2
+                        torch.testing.assert_close(
+                            actual_value,
+                            expected_value,
+                            rtol=tolerance,
+                            atol=tolerance,
+                            msg=lambda message, name=name: f"{name}: {message}",
+                        )
+                        continue
+                    direction = {
+                        "output": "fwd",
+                        "x": "grad",
+                        "topk_scores": "grad",
+                    }.get(name, "wgrad")
+                    _rtol, _atol, relative_l2, cosine = _blockscaled_tolerance(
+                        block_scaled.format, direction
+                    )
+                    self.assertLess(
+                        _relative_l2(actual_value, expected_value),
+                        relative_l2,
+                        msg=name,
+                    )
+                    self.assertGreater(
+                        _cosine_similarity(actual_value, expected_value),
+                        cosine,
+                        msg=name,
+                    )
 
     def test_bf16_modes_are_visible_to_non_strict_tracing(self) -> None:
         """Trace BF16 training and inference through their registered ops."""

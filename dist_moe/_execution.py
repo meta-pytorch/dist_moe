@@ -20,6 +20,7 @@ from torch.distributed.tensor import DTensor
 
 from ._postprocess import (
     _postprocess_requires_eager,
+    InputScaledRMSNormPostprocess,
     RMSNormPostprocess,
 )
 from .formats import BlockScaledFormat as _KernelBlockScaledFormat
@@ -111,8 +112,11 @@ class ExecutionOptions:
         experts_output_postprocess: Optional deterministic callable applied to
             each route-wise expert output before score weighting and top-k
             reduction, or ``RMSNormPostprocess`` for fused RMSNorm plus top-k
-            reduction. A callable must preserve shape,
-            device, contiguity, and dtype across forward and backward replay.
+            reduction. ``InputScaledRMSNormPostprocess`` selects fused
+            kernels for a trainable input-scale RMSNorm on BF16 routes and
+            runs as an eager callback for shapes they do not cover. A callable
+            must preserve shape, device, contiguity, and dtype across forward
+            and backward replay.
             Closure parameters accumulate gradients through nested backward
             and are not explicit inputs to the outer custom autograd function.
         wgrad_postprocess_fn: Hook invoked as soon as each WGRAD is available.
@@ -149,7 +153,10 @@ class ExecutionOptions:
     )
     weights_preprocess_fn: WeightPreprocessFn | None = None
     experts_output_postprocess: (
-        Callable[[torch.Tensor], torch.Tensor] | RMSNormPostprocess | None
+        Callable[[torch.Tensor], torch.Tensor]
+        | RMSNormPostprocess
+        | InputScaledRMSNormPostprocess
+        | None
     ) = None
     wgrad_postprocess_fn: WgradPostprocessFn | None = None
     swiglu_clip_stats_out_3: torch.Tensor | None = None
